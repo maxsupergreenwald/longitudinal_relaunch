@@ -45,7 +45,7 @@ USER_NAMES = {
 }
 
 REDCAP_API_URL = os.getenv("AIM8_REDCAP_API_URL", "https://redcap.research.yale.edu/api/")
-BASELINE_API_TOKEN = os.getenv("AIM8_BASELINE_API_TOKEN", "1D481003114ECDA8E4077078E0D08D0A")
+RELAUNCH_API_TOKEN = "64C5D967CBEB77335224862283A74F4D"
 IPINFO_TOKEN = os.getenv("AIM8_IPINFO_TOKEN", "20f981656f0139")
 SHAREPOINT_PAYMENT_UPLOAD_URL = os.getenv(
     "AIM8_SHAREPOINT_PAYMENT_URL",
@@ -377,7 +377,7 @@ class RelaunchQuickQC:
         self._check_incomplete_flags(QC_TODO_PATH)
         ensure_directory(self.date_directory)
 
-        self.project = Project(REDCAP_API_URL, BASELINE_API_TOKEN)
+        self.project = Project(REDCAP_API_URL, RELAUNCH_API_TOKEN)
         raw_df = self.project.export_records(format_type="df").reset_index(names="record_id")
         self.metadata = self.project.export_metadata(format_type="df")
         self.df = self._clean_export(raw_df)
