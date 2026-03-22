@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//private/tmp/**)",
+      "Read(//tmp/**)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(cp \"csvs/Psychedelics1BLongitudinalRela_DataDictionary_2026-03-22.csv\" /tmp/dd_both_changes.csv)",
+      "Bash(git checkout:*)",
+      "Bash(Lab\"\\) and moves the opt-out option to choice 6, fixing a typo \\(\"sutdy\"\\) in that:*)",
+      "Read(//Users/msg74/Desktop/powers_lab/psychedelics_dissertation/Aim1_Online_Survey_Tasks/RedCapStuff/Longitudinal_Relaunch/NR>1 {label=$5; if \\(label ~ /dose|threshold|light|common|strong|heavy|medium|microdose|very heavy|times.*use|how old|last time.*use|psychedelic.*dose|dose.*level/**)",
+      "Read(//Users/msg74/Desktop/powers_lab/psychedelics_dissertation/Aim1_Online_Survey_Tasks/RedCapStuff/Longitudinal_Relaunch/NR>1 {field=$1; label=$5; if \\(field ~ /^\\(psyched_|sp_|validity_|fraud_|psychedelicuse_|psycheduse_\\)/ && label ~ /dose|threshold|light|common|strong|heavy|medium|microdose|times|age.*first|when.*last/i\\) {gsub\\(/\"\"\"\"[^\"\"\"\"]*\"\"\"\"/**)"
+    ]
+  }
+}

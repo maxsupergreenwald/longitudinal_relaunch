@@ -1,0 +1,189 @@
+﻿alert-unique-id,alert-title,alert-trigger,unique-form-name,saved-with-form-status,alert-condition,ensure-logic-still-true,do-not-clear-recurrences,alert-stop-type,send-on,send-on-next-day-type,send-on-next-time,send-on-time-lag-days,send-on-time-lag-hours,send-on-time-lag-minutes,send-on-field-after,send-on-field,send-on-date,alert-send-how-many,every-time-type,repeat-for,repeat-for-units,repeat-for-max,alert-expiration,alert-type,email-from-display,email-from,email-to,email-cc,email-bcc,email-failed,email-subject,alert-message,sendgrid-template-id,sendgrid-template-data,sendgrid-mail-send-configuration,prevent-piping-identifiers,file-upload-fields,phone-number-to,alert-deactivated
+A-906,Oops,LOGIC,,ANY,[send_oops]='1',Y,N,RECORD,TIME_LAG,,,0,0,10,after,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,[email_rpt],,,,"Corrected! Longitudinal Study Consent Form Errors","<p>Hello!</p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted by the Powers lab regarding research participation, and you were recently invited to a longitudinal study.</p>
+<p> </p>
+<p>Folks have brought to our attention that there were errors in the forms preventing folks from moving forward and not displaying the consent form!</p>
+<p> </p>
+<p>We are so sorry for the error!</p>
+<p> </p>
+<p><span style=""text-decoration: underline;"">The form is corrected, and you can now continue at the following link:</span></p>
+<p><span style=""font-size: 14pt;""><strong>[survey-link:consent_rpt:Consent Link (again)]</strong></span></p>
+<p> </p>
+<p>We have also <strong>re-attached the instructions </strong>for the study here, since folks have said that the attachment was blank or would not open before. </p>
+<p> </p>
+<p>Thank you again so much for your participation and patience! Please, please do not ever hesitate to reach out to myself or the lab if you run into issues with the study. </p>
+<p style=""background: white;""><strong>------------------------------------</strong></p>
+<p style=""background: white;""><strong>Max Greenwald</strong></p>
+<p style=""background: white;"">MD-PhD Candidate | Powers Lab</p>
+<p style=""background: white;"">Yale School of Medicine</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><i>(he/him/his)</i><i></i></p>",,{},{},Y,,,N
+A-916,"Reminder -- Consent",LOGIC,,ANY,[send_start_reminder]='1',Y,N,RECORD,TIME_LAG,,,0,0,15,after,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,[email_rpt],,,,"Powers Lab Longitudinal Study: Checking in","<p>Hello!</p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted by the Powers lab regarding research participation, and you were recently invited to a longitudinal study.</p>
+<p> </p>
+<p>We just wanted to send a quick follow-up to <strong>ask if you have any questions or concerns</strong>, as we see <strong>you opened but did not sign the new consent form</strong>! </p>
+<p> </p>
+<p>In case you lost your link, <strong><span style=""font-size: 14pt;"">[survey-link:consent_rpt:here is your personalized link to continue]</span></strong></p>
+<p> </p>
+<p>We are also <strong>re-attaching the instructions </strong>for the study here, in case it is helpful. </p>
+<p> </p>
+<p>Thank you again so much for your participation and patience! Please, please do not ever hesitate to reach out to the primary investigator, Max Greenwald (maximillian.greenwald@yale.edu) or the lab (see below) if you run into issues with the study : ) </p>
+<p> </p>
+<p>Max</p>
+<p>---------------------------------------------------------</p>
+<p>Powers Lab | Yale University</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><em>Email: </em><a href=""mailto:powers.lab@yale.edu"">powers.lab@yale.edu</a> </p>",,{},{},Y,,,N
+A-917,"Reminder -- Instructions",LOGIC,,ANY,[send_instructions_reminder]='1',Y,N,RECORD,TIME_LAG,,,0,0,15,after,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,[email_rpt],,,,"Powers Lab Longitudinal Study: Checking in","<p>Hello!</p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted by the Powers lab regarding research participation, and you were recently invited to a longitudinal study.</p>
+<p> </p>
+<p>We just wanted to send a quick follow-up to <strong>ask if you have any questions or concerns</strong>, as we see <strong>you did not move past the instructions and so <span style=""text-decoration: underline;"">have not triggered the emails that let you actually start the study (play the games at each time-point)</span></strong>! </p>
+<p> </p>
+<p>In case you lost your link, <strong><span style=""font-size: 14pt;"">[survey-link:repeat_measures_study_instructions:here is your personalized link to continue]</span></strong></p>
+<p> </p>
+<p>We are also <strong>re-attaching the instructions </strong>for the study here, in case it is helpful. </p>
+<p> </p>
+<p>Thank you again so much for your participation and patience! Please, please do not ever hesitate to reach out to the primary investigator, Max Greenwald (maximillian.greenwald@yale.edu) or the lab (see below) if you run into issues with the study : ) </p>
+<p> </p>
+<p>Max</p>
+<p>---------------------------------------------------------</p>
+<p>Powers Lab | Yale University</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><em>Email: </em><a href=""mailto:powers.lab@yale.edu"">powers.lab@yale.edu</a> </p>",,{},{},Y,,,N
+A-1039,"Payment Confirmation Receipt Hyp",LOGIC,,ANY,"([qc_passed_hyp]='1') and ([send_pay_confirm_hyp]='1')",N,N,RECORD,TIME_LAG,,,21,0,0,after,,,ONCE,,,,,,EMAIL,"Powers Lab @ Yale University",maximillian.greenwald@yale.edu,[email_addtl_contact_rpt],,,,"Please Confirm Payment Receipt for Powers Lab Online Research Study! ","<p>Hello! </p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted regarding your participation in an online research study by the Powers Lab. </p>
+<p> </p>
+<p>This email is being sent to <strong>ask that you confirm that you have received your $60 compensation for your participation in the Acute Effects section of the study! </strong>If you did not receive the payment -- <strong>let us know that we need to fix this!</strong></p>
+<p> </p>
+<p>Please let us know at the following link:</p>
+<p><span style=""font-size: 18pt;""><strong>[survey-link:payment_confirmation_hyp:Click here to let us know whether you received your payment]</strong></span></p>
+<p> </p>
+<p>Thank you again for your participation, and have a fantastic day!</p>
+<p> </p>
+<p>P.S. if you used a digital US bank gift card, instructions are again attached for your convenience -- <em><strong>MAKE SURE YOU CLAIM YOUR CARD WITHIN 30 DAYS!!!</strong></em></p>
+<p> </p>
+<p>---------------------------------------------------------</p>
+<p>Powers Lab | Yale University</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><em>Email: </em><a href=""mailto:powers.lab@yale.edu"">powers.lab@yale.edu</a> </p>",,{},{},Y,,,N
+A-1040,"Payment Late Hyp",LOGIC,,ANY,([payment_confirm_hyp]='0'),N,N,RECORD,NOW,,,,,,,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,catalina.mourgues@yale.edu;maximillian.greenwald@yale.edu;silmilly.toribio@yale.edu,,,,"Participant for psychedelics project reporting missing payment!","<p>Hi, Silmilly, Cata, and Max!</p>
+<p> </p>
+<p>This email means that participant [record_id] has reported that their payment has still not arrived after 15 business days :( </p>
+<p> </p>
+<p>Here are helpful links:</p>
+<p>[form-link:payment_form_hyp:Their Payment Form with details of participation etc.]</p>
+<p>[form-link:payment_confirmation_hyp:Their Answers]</p>
+<p> </p>
+<p>Thanks!</p>
+<p> </p>
+<p>&lt;3 Past Max</p>",,{},{},Y,,,N
+A-1041,"Payment Confirmation Receipt Acu",LOGIC,,ANY,"([qc_passed_acu]='1') and ([send_pay_confirm_acu]='1')",N,N,RECORD,TIME_LAG,,,21,0,0,after,,,ONCE,,,,,,EMAIL,"Powers Lab @ Yale University",maximillian.greenwald@yale.edu,[email_addtl_contact_rpt],,,,"Please Confirm Payment Receipt for Powers Lab Online Research Study! ","<p>Hello! </p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted regarding your participation in an online research study by the Powers Lab. </p>
+<p> </p>
+<p>This email is being sent to <strong>ask that you confirm that you have received your $60 compensation for your participation in the Day-After section of the study! </strong>If you did not receive the payment -- <strong>let us know that we need to fix this!</strong></p>
+<p> </p>
+<p>Please let us know at the following link:</p>
+<p><span style=""font-size: 18pt;""><strong>[survey-link:payment_confirmation_acu:Click here to let us know whether you received your payment]</strong></span></p>
+<p> </p>
+<p>Thank you again for your participation, and have a fantastic day!</p>
+<p> </p>
+<p>P.S. if you used a digital US bank gift card, instructions are again attached for your convenience -- <em><strong>MAKE SURE YOU CLAIM YOUR CARD WITHIN 30 DAYS!!!</strong></em></p>
+<p> </p>
+<p>---------------------------------------------------------</p>
+<p>Powers Lab | Yale University</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><em>Email: </em><a href=""mailto:powers.lab@yale.edu"">powers.lab@yale.edu</a> </p>",,{},{},Y,,,N
+A-1042,"Payment Late Acu",LOGIC,,ANY,([payment_confirm_acu]='0'),N,N,RECORD,NOW,,,,,,,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,catalina.mourgues@yale.edu;maximillian.greenwald@yale.edu;silmilly.toribio@yale.edu,,,,"Participant for psychedelics project reporting missing payment!","<p>Hi, Silmilly, Cata, and Max!</p>
+<p> </p>
+<p>This email means that participant [record_id] has reported that their payment has still not arrived after 15 business days :( </p>
+<p> </p>
+<p>Here are helpful links:</p>
+<p>[form-link:payment_form_acu:Their Payment Form with details of participation etc.]</p>
+<p>[form-link:payment_confirmation_acu:Their Answers]</p>
+<p> </p>
+<p>Thanks!</p>
+<p> </p>
+<p>&lt;3 Past Max</p>",,{},{},Y,,,N
+A-1043,"Payment Confirmation Receipt Sub",LOGIC,,ANY,"([qc_passed_sub]='1') and ([send_pay_confirm_sub]='1')",N,N,RECORD,TIME_LAG,,,21,0,0,after,,,ONCE,,,,,,EMAIL,"Powers Lab @ Yale University",maximillian.greenwald@yale.edu,[email_addtl_contact_rpt],,,,"Please Confirm Payment Receipt for Powers Lab Online Research Study! ","<p>Hello! </p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted regarding your participation in an online research study by the Powers Lab. </p>
+<p> </p>
+<p>This email is being sent to <strong>ask that you confirm that you have received your $60 compensation for your participation in the 1-2 Weeks After section of the study! </strong>If you did not receive the payment -- <strong>let us know that we need to fix this!</strong></p>
+<p> </p>
+<p>Please let us know at the following link:</p>
+<p><span style=""font-size: 18pt;""><strong>[survey-link:payment_confirmation_sub:Click here to let us know whether you received your payment]</strong></span></p>
+<p> </p>
+<p>Thank you again for your participation, and have a fantastic day!</p>
+<p> </p>
+<p>P.S. if you used a digital US bank gift card, instructions are again attached for your convenience -- <em><strong>MAKE SURE YOU CLAIM YOUR CARD WITHIN 30 DAYS!!!</strong></em></p>
+<p> </p>
+<p>---------------------------------------------------------</p>
+<p>Powers Lab | Yale University</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><em>Email: </em><a href=""mailto:powers.lab@yale.edu"">powers.lab@yale.edu</a> </p>",,{},{},Y,,,N
+A-1044,"Payment Late Sub",LOGIC,,ANY,([payment_confirm_sub]='0'),N,N,RECORD,NOW,,,,,,,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,catalina.mourgues@yale.edu;maximillian.greenwald@yale.edu;silmilly.toribio@yale.edu,,,,"Participant for psychedelics project reporting missing payment!","<p>Hi, Silmilly, Cata, and Max!</p>
+<p> </p>
+<p>This email means that participant [record_id] has reported that their payment has still not arrived after 15 business days :( </p>
+<p> </p>
+<p>Here are helpful links:</p>
+<p>[form-link:payment_form_sub:Their Payment Form with details of participation etc.]</p>
+<p>[form-link:payment_confirmation_sub:Their Answers]</p>
+<p> </p>
+<p>Thanks!</p>
+<p> </p>
+<p>&lt;3 Past Max</p>",,{},{},Y,,,N
+A-1045,"Payment Confirmation Receipt Pers",LOGIC,,ANY,"([qc_passed_pers]='1') and ([send_pay_confirm_pers]='1')",N,N,RECORD,TIME_LAG,,,21,0,0,after,,,ONCE,,,,,,EMAIL,"Powers Lab @ Yale University",maximillian.greenwald@yale.edu,[email_addtl_contact_rpt],,,,"Please Confirm Payment Receipt for Powers Lab Online Research Study! ","<p>Hello! </p>
+<p> </p>
+<p>You are receiving this email because you consented to be contacted regarding your participation in an online research study by the Powers Lab. </p>
+<p> </p>
+<p>This email is being sent to <strong>ask that you confirm that you have received your $60 compensation for participation in the 1-6 months after section of the study! </strong>If you did not receive the payment -- <strong>let us know that we need to fix this!</strong></p>
+<p> </p>
+<p>Please let us know at the following link:</p>
+<p><span style=""font-size: 18pt;""><strong>[survey-link:payment_confirmation_pers:Click here to let us know whether you received your payment]</strong></span></p>
+<p> </p>
+<p>Thank you again for your participation, and have a fantastic day!</p>
+<p> </p>
+<p>P.S. if you used a digital US bank gift card, instructions are again attached for your convenience -- <em><strong>MAKE SURE YOU CLAIM YOUR CARD WITHIN 30 DAYS!!!</strong></em></p>
+<p> </p>
+<p>---------------------------------------------------------</p>
+<p>Powers Lab | Yale University</p>
+<p style=""background: white;""><i>Phone: ‪(203) 441-7213</i></p>
+<p style=""background: white;""><em>Email: </em><a href=""mailto:powers.lab@yale.edu"">powers.lab@yale.edu</a> </p>",,{},{},Y,,,N
+A-1046,"Payment Late Pers",LOGIC,,ANY,([payment_confirm_pers]='0'),N,N,RECORD,NOW,,,,,,,,,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,catalina.mourgues@yale.edu;maximillian.greenwald@yale.edu;silmilly.toribio@yale.edu,,,,"Participant for psychedelics project reporting missing payment!","<p>Hi, Silmilly, Cata, and Max!</p>
+<p> </p>
+<p>This email means that participant [record_id] has reported that their payment has still not arrived after 15 business days :( </p>
+<p> </p>
+<p>Here are helpful links:</p>
+<p>[form-link:payment_form_pers:Their Payment Form with details of participation etc.]</p>
+<p>[form-link:payment_confirmation_pers:Their Answers]</p>
+<p> </p>
+<p>Thanks!</p>
+<p> </p>
+<p>&lt;3 Past Max</p>",,{},{},Y,,,N
+A-1142,"24 Hour Timepoint Reminder",LOGIC,,ANY,"[timestamp_hyp_pre]<>"""" and (
+    
+    [timestamp_vch_hyp]<>"""" or
+    [timestamp_hyp_post]<>"""" 
+    
+)",Y,N,RECORD,TIME_LAG,,,0,12,0,after,[timestamp_hyp_pre],,ONCE,,,,,,EMAIL,,maximillian.greenwald@yale.edu,[email_rpt],,,,"Reminder: 24 Hour Time-point Computer Games for Powers Lab Online Study","<p>Hello!</p>
+<p> </p>
+<p>Just sending along a reminder that it is <strong>now time to complete the <span style=""font-size: 14pt;"">24hr time-point's computer games</span></strong>!😊 </p>
+<p> </p>
+<p>Recall, these games are designed to take <strong>2 hours</strong> and <span style=""font-size: 14pt;""><em><strong>you have until the end of the day to complete the games.</strong></em></span></p>
+<p> </p>
+<p>All you'll need is <em><strong>THE SAME </strong></em>laptop or computer (<strong>not a tablet</strong>), good internet,  <em><strong>THE SAME </strong></em><strong>headphones</strong>, a distraction-free space, and <span style=""font-size: 18pt;""><strong>[survey-link:acute_presurvey:</strong><strong>this link to start the questions/games]</strong></span></p>
+<p> </p>
+<p>As always, if you have any questions or problems, please just email  <a href=""mailto:maximillian.greenwald@yale.edu"">maximillian.greenwald@yale.edu</a>! </p>
+<p> </p>
+<p>Thank you SO much for your participation in research! </p>
+<p class=""p1"">---------------------</p>
+<p style=""background: white;""><strong>Max Greenwald</strong></p>
+<p style=""background: white;"">MD-PhD Student | Powers Lab</p>
+<p style=""background: white;"">Yale School of Medicine</p>
+<p style=""background: white;"">Phone: ‪(203) 441-7213</p>
+<p style=""background: white;"">(he/him/his)</p>",,{},{},Y,,,N

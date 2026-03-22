@@ -102,10 +102,9 @@ FORBIDDEN_IP_COUNTRIES = {"Nigeria", "Ghana"}
 SAFE_DUPLICATE_IP_ORGS = {"AS14550 Middlebury College", "AS29 Yale University"}
 
 SCREENING_EMAIL_FIELDS = [
-    "payment_email_bl",
-    "payment_email_bl_2",
-    "email_addtl_contact",
     "email_rpt",
+    "email_rpt_2",
+    "email_addtl_contact",
     "interested_spstudy",
 ]
 
@@ -560,7 +559,12 @@ class RelaunchQuickQC:
 
         pass_go = [record_id for record_id, verdict in phone_verdicts.items() if verdict == "n"]
         hard_fail = set(review.hard_fail)
-        hard_fail.update(record_id for record_id, verdict in phone_verdicts.items() if verdict == "y")
+        # Merge phone-verdict 'y' into ineligibility_notes before updating hard_fail
+        for record_id, verdict in phone_verdicts.items():
+            if verdict == "y":
+                if record_id not in review.ineligibility_notes:
+                    add_reason(review.ineligibility_notes, record_id, "Flagged as fraudulent/VOIP by phone review")
+                hard_fail.add(record_id)
         manual_followup = set(review.manual_followup)
         manual_followup.update(record_id for record_id, verdict in phone_verdicts.items() if verdict == "?")
 
@@ -580,9 +584,16 @@ class RelaunchQuickQC:
             for record_id, reason in review.ineligibility_notes.items():
                 updates.loc[updates["record_id"] == record_id, "ineligibilty_reason"] = reason
 
+        # Write rejection reason into qc_notes for all hard-fail records
+        if "qc_notes" in updates.columns:
+            for record_id, reason in review.ineligibility_notes.items():
+                if record_id in hard_fail:
+                    updates.loc[updates["record_id"] == record_id, "qc_notes"] = reason
+
         desired_fields = [
             "screening_pass",
             "qc_passed",
+            "qc_notes",
             "eligible_notify",
             "ineligibile_fraud",
             "ip_zoom_invite",
@@ -804,6 +815,7 @@ class RelaunchQuickQC:
         # --------------------------------------------
         failed_attn_check = self._find_failed_attention_checks(df_raw)
         failed_new_qc = self._find_race_age_mismatch(df_raw)
+        failed_trap_questions = self._find_trap_question_failures(df_raw)
         sp_findings = self._evaluate_absurd_sp_responses(df_raw)
         no_sms_verification = df_raw.loc[df_raw["phone_verified"].isna(), "record_id"].tolist()
         no_main_survey = df_raw.loc[df_raw["si_2_v2"].isna(), "record_id"].tolist()
@@ -830,6 +842,7 @@ class RelaunchQuickQC:
         qc_lists = {
             "failedAttnCheck": to_int_list(failed_attn_check),
             "failed_new_qc": to_int_list(failed_new_qc),
+            "failed_trap_questions": to_int_list(failed_trap_questions),
             "failed_sp_qc": to_int_list(sp_findings["failed_sp_qc"]),
             "failed_usetime_qc": to_int_list(sp_findings["failed_usetime_qc"]),
             "illogical_year": to_int_list(sp_findings["illogical_year"]),
@@ -975,6 +988,40 @@ class RelaunchQuickQC:
             return []
         totals = df_raw[existing].apply(pd.to_numeric, errors="coerce").sum(axis=1)
         return to_int_list(df_raw.loc[totals < len(existing), "record_id"].tolist())
+
+    def _find_trap_question_failures(self, df_raw: pd.DataFrame) -> list[int]:
+        """Flag records that fail any trap / fraud-detection check:
+        - kaopectamine_lifetime == '1'  (fake drug endorsed — radio field, Yes=1)
+        - fraud_recent_dose == '1'           (dose self-report doesn't match computed most-recent dose)
+        - fraud_caps == '0'                  (missed embedded CAPS attention check — correct answer is Yes/1)
+        - fraud_pdi == '0'                   (missed embedded PDI attention check — correct answer is Yes/1)
+        A record is flagged (full fraud response) if kaopectamine or dose mismatch OR if either
+        attention check was answered incorrectly (answered No).
+        """
+        failures: set[int] = set()
+
+        # kaopectamine_lifetime: radio field (1=Yes, 2=No)
+        kao_field = "kaopectamine_lifetime"
+        if kao_field in df_raw.columns:
+            mask = df_raw[kao_field].astype(str).str.strip() == "1"
+            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+
+        # fraud_recent_dose: calc returns 1 when dose report mismatches
+        if "fraud_recent_dose" in df_raw.columns:
+            mask = pd.to_numeric(df_raw["fraud_recent_dose"], errors="coerce") == 1
+            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+
+        # fraud_caps: yesno — correct answer is Yes (1); flag if answered No (0)
+        if "fraud_caps" in df_raw.columns:
+            mask = df_raw["fraud_caps"].astype(str).str.strip() == "0"
+            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+
+        # fraud_pdi: yesno — correct answer is Yes (1); flag if answered No (0)
+        if "fraud_pdi" in df_raw.columns:
+            mask = df_raw["fraud_pdi"].astype(str).str.strip() == "0"
+            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+
+        return [int(r) for r in sorted(failures)]
 
     def _find_race_age_mismatch(self, df_raw: pd.DataFrame) -> list[int]:
         required = {"race_qc", "race_v2", "age_qc", "age_v2"}
@@ -1532,6 +1579,7 @@ class RelaunchQuickQC:
         note_map = {
             "failedAttnCheck": "Failed attention check",
             "failed_new_qc": "Failed race/age consistency QC",
+            "failed_trap_questions": "Failed trap/fraud-detection questions (fake drug or dose mismatch or missed attention check)",
             "fraud_copy_paste_ach": "Copy pasted ACH data",
             "fraud_copy_paste_vch": "Copy pasted VCH data",
             "fraud_copy_paste_prl": "Copy pasted PRL data",
@@ -1650,9 +1698,9 @@ class RelaunchQuickQC:
                 continue
             row = source.iloc[0]
 
-            payment_email = clean_email(row.get("payment_email_bl", np.nan))
+            payment_email = clean_email(row.get("email_rpt", np.nan))
             if not payment_email:
-                print(f"Record {record_id} passed QC but is missing payment_email_bl.")
+                print(f"Record {record_id} passed QC but is missing email_rpt.")
                 continue
 
             payment_rows.append(
