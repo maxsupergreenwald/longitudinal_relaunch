@@ -140,6 +140,7 @@ class ScreeningReview:
     suspicious_ip: list[int] = field(default_factory=list)
     phone_review: list[int] = field(default_factory=list)
     manual_followup: list[int] = field(default_factory=list)
+    sp_wait: list[int] = field(default_factory=list)
     ineligibility_notes: dict[int, str] = field(default_factory=dict)
 
 
@@ -515,6 +516,7 @@ class RelaunchQuickQC:
         review.hard_fail = sorted(set(review.hard_fail))
         review.suspicious_ip = sorted(set(review.suspicious_ip))
         review.manual_followup = sorted(set(review.manual_followup))
+        review.sp_wait = sorted(set(review.sp_wait))
 
         self._write_screening_summary(review)
         return review
@@ -568,13 +570,27 @@ class RelaunchQuickQC:
         manual_followup = set(review.manual_followup)
         manual_followup.update(record_id for record_id, verdict in phone_verdicts.items() if verdict == "?")
 
+        # sp_wait records that fail phone/IP review fall back to the normal fraud path.
+        sp_wait_set = set(review.sp_wait)
+        sp_wait_cleared = [rid for rid in pass_go if rid in sp_wait_set]
+        normal_pass = [rid for rid in pass_go if rid not in sp_wait_set]
+
         updates.loc[updates["record_id"].isin(hard_fail), ["screening_pass", "qc_passed"]] = 0
         if "ineligibile_fraud" in updates.columns:
             updates.loc[updates["record_id"].isin(hard_fail), "ineligibile_fraud"] = 1
 
-        updates.loc[updates["record_id"].isin(pass_go), "screening_pass"] = 1
+        # Normal pass: immediately eligible, send eligible_notify.
+        updates.loc[updates["record_id"].isin(normal_pass), "screening_pass"] = 1
         if "eligible_notify" in updates.columns:
-            updates.loc[updates["record_id"].isin(pass_go), "eligible_notify"] = 1
+            updates.loc[updates["record_id"].isin(normal_pass), "eligible_notify"] = 1
+
+        # SP-wait pass: passed phone/IP check but must wait out the washout period.
+        # screening_pass=1 so they leave the screening queue; eligible_afterwait_notify
+        # triggers the continue_date-scheduled email instead of the immediate eligible_notify.
+        updates.loc[updates["record_id"].isin(sp_wait_cleared), "screening_pass"] = 1
+        if "eligible_afterwait_notify" in updates.columns:
+            updates.loc[updates["record_id"].isin(sp_wait_cleared), "eligible_afterwait_notify"] = 1
+
         if "ip_zoom_invite" in updates.columns:
             updates.loc[updates["record_id"].isin(review.suspicious_ip), "ip_zoom_invite"] = 1
         if "max_number_followup" in updates.columns:
@@ -595,6 +611,7 @@ class RelaunchQuickQC:
             "qc_passed",
             "qc_notes",
             "eligible_notify",
+            "eligible_afterwait_notify",
             "ineligibile_fraud",
             "ip_zoom_invite",
             "max_number_followup",
@@ -604,7 +621,7 @@ class RelaunchQuickQC:
         desired_fields = [field for field in desired_fields if field in updates.columns]
         updates = updates[desired_fields].copy()
 
-        for field in ["screening_pass", "qc_passed", "eligible_notify", "ineligibile_fraud", "ip_zoom_invite", "max_number_followup"]:
+        for field in ["screening_pass", "qc_passed", "eligible_notify", "eligible_afterwait_notify", "ineligibile_fraud", "ip_zoom_invite", "max_number_followup"]:
             if field in updates.columns:
                 updates[field] = pd.to_numeric(updates[field], errors="coerce").astype("Int64")
 
@@ -682,10 +699,28 @@ class RelaunchQuickQC:
                 (numeric_value(row, "no_computer") > 0, "No computer access"),
                 (numeric_value(row, "english_fluency") < 1, "English fluency not met"),
                 (pd.isna(row.get("geo_crit", np.nan)), "Geographic fraud flag"),
+                # Fake drug trap question checked at screening stage
+                (string_value(row, "kaopectamine_lifetime").strip() == "1", "Endorsed fake drug (kaopectamine) during screening"),
             ]
 
-            if not pd.isna(numeric_value(row, "sp_lastuse_days_screen")) and numeric_value(row, "sp_lastuse_days_screen") < 42:
-                checks.append((True, "Reported SP/atypical use within the last 42 days"))
+            # SP/atypical use within the past 6 weeks — handle separately to support the
+            # willing-to-wait path (psychedelic_abstinence_yn='1').
+            sp_recent = (
+                not pd.isna(numeric_value(row, "sp_dayslastuse"))
+                and numeric_value(row, "sp_dayslastuse") < 42
+            )
+            atypical_recent = string_value(row, "atypical_recentuse").strip() == "1"
+            willing_to_wait = string_value(row, "psychedelic_abstinence_yn").strip() == "1"
+
+            if sp_recent or atypical_recent:
+                if willing_to_wait:
+                    # Participant acknowledged the washout requirement and agreed to wait.
+                    # Subject them to the normal phone/IP review.  Eligibility and payment
+                    # notification are deferred to continue_date via eligible_afterwait_notify.
+                    review.sp_wait.append(record_id)
+                else:
+                    add_reason(review.ineligibility_notes, record_id, "Reported SP/atypical use within the last 42 days")
+                    review.hard_fail.append(record_id)
 
             for failed, reason in checks:
                 if failed:
@@ -757,6 +792,7 @@ class RelaunchQuickQC:
             f"- Suspicious duplicate IP: {len(set(review.suspicious_ip))}",
             f"- Needs phone review: {len(set(review.phone_review))}",
             f"- Needs manual follow-up: {len(set(review.manual_followup))}",
+            f"- SP wait path (willing to wait 6 weeks): {len(set(review.sp_wait))}",
             "",
             "## Record Notes",
         ]

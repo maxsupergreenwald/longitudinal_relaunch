@@ -19,7 +19,7 @@ qc_testing_debug.py verify <ID>       <- check expected fields
 qc_testing_debug.py restore           <- restore snapshot before next scenario
 ```
 
-**46 scenarios total:** SCR-00 through SCR-18 (screening) and BL-00 through BL-26 (baseline QC).
+**57 scenarios total:** SCR-00 through SCR-19 plus SCR-11b/c/d (screening) and BL-00 through BL-27 plus BL-17b/BL-23b (baseline QC).
 
 ---
 
@@ -378,17 +378,19 @@ Sets `geo_crit=""` (blank string in REDCap exports as NaN in the pandas DataFram
 
 ---
 
-### SCR-11 — Recent SP Use (Within 42 Days)
+### SCR-11 — Recent SP Use, Not Willing to Wait (Hard Fail)
 
-**What it tests:** `sp_lastuse_days_screen=30` triggers "Reported SP/atypical use within the last 42 days" hard fail.
+**What it tests:** `sp_dayslastuse=30` (recent SP use) AND `psychedelic_abstinence_yn` not set to `1` (participant did NOT agree to wait) → hard fail.
 
 **Setup:**
 ```bash
 python3 qc_testing_debug.py apply SCR-11
 ```
-Sets `sp_lastuse_days_screen=30`.
+Sets `sp_dayslastuse=30` and clears `psychedelic_abstinence_yn`.
 
 **QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail occurs before the phone verdict prompt — you will not be asked for a phone verdict.
 
 **Expected REDCap result:**
 | Field | Expected value |
@@ -398,6 +400,90 @@ Sets `sp_lastuse_days_screen=30`.
 | `ineligibile_fraud` | 1 |
 
 **Verify:** `python3 qc_testing_debug.py verify SCR-11`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-11b — Recent SP Use, Willing to Wait, Clean Phone/IP
+
+**What it tests:** `sp_dayslastuse=30` (recent SP use) AND `psychedelic_abstinence_yn='1'` (willing to wait) AND phone/IP look clean → `screening_pass=1`, `eligible_afterwait_notify=1` (NOT `eligible_notify`).
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-11b
+```
+Sets `sp_dayslastuse=30` and `psychedelic_abstinence_yn=1`. No IP overrides — uses the clean stub IP from `ips_full.csv`.
+
+**QC script prompts:**
+- User code: `m`
+- Phone verdict: `n` (looks clean)
+- Import prompt: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 1 |
+| `eligible_notify` | (blank/null — NOT set) |
+| `eligible_afterwait_notify` | 1 |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-11b`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+**Notes:** This record is now queued to receive a continuation email at `continue_date` (calculated from the substance dayslastuse fields). The participant never receives the immediate eligible_notify email.
+
+---
+
+### SCR-11c — Recent SP Use, Willing to Wait, Fraudulent Phone
+
+**What it tests:** `sp_dayslastuse=30`, `psychedelic_abstinence_yn='1'` (willing to wait), but researcher enters `y` at phone verdict → falls back to the normal fraud path. sp_wait does NOT protect against explicit phone fraud.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-11c
+```
+Sets `sp_dayslastuse=30` and `psychedelic_abstinence_yn=1`. No other overrides — the `y` verdict causes the fail.
+
+**QC script prompts:**
+- User code: `m`
+- Phone verdict: `y` (fraudulent/VOIP)
+- Import prompt: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `eligible_afterwait_notify` | (blank/null — NOT set) |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-11c`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-11d — Recent Atypical Use, Willing to Wait, Clean
+
+**What it tests:** SP dayslastuse is fine but `mdma_dayslastuse=10` (atypical substance used recently) AND `psychedelic_abstinence_yn='1'` → `atypical_recentuse='1'` triggers the sp_wait path. Result: `screening_pass=1`, `eligible_afterwait_notify=1`.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-11d
+```
+Sets `mdma_lifetime=1`, `mdma_dayslastuse=10`, `psychedelic_abstinence_yn=1`. Leaves `sp_dayslastuse` above 42.
+
+**QC script prompts:**
+- User code: `m`
+- Phone verdict: `n`
+- Import prompt: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 1 |
+| `eligible_afterwait_notify` | 1 |
+| `eligible_notify` | (blank/null) |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-11d`
 **Reset:** `python3 qc_testing_debug.py restore`
 
 ---
@@ -582,6 +668,33 @@ Deletes the row for record_id=1 from `ips_full.csv`.
 | `qc_passed` | (blank/null) |
 
 **Verify:** `python3 qc_testing_debug.py verify SCR-18`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-19 — Fake Drug Endorsed at Screening (Kaopectamine)
+
+**What it tests:** `kaopectamine_lifetime='1'` — participant endorsed the fake trap drug during the screening survey → `_apply_screening_eligibility_rules()` catches it at screening time and adds to hard_fail. This is distinct from BL-03 (same trap caught at baseline QC); SCR-19 verifies the earlier screening-stage catch.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-19
+```
+Sets `kaopectamine_lifetime=1` on record_id=1.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail before phone verdict — you will not be asked for a phone verdict.
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "kaopectamine") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-19`
 **Reset:** `python3 qc_testing_debug.py restore`
 
 ---
@@ -1302,6 +1415,91 @@ Sets `ach_replay=1`, `ach_replay_2=1`, `ach_replay_3=1`, `ach_replay_4=1` and im
 
 **Verify:** `python3 qc_testing_debug.py verify BL-26`
 **Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### BL-17b — ACH 2nd Replay Attempt (Slot 2)
+
+**What it tests:** Participant has already done one ACH retry (`ach_replay=1` is set, task data cleared), submits a second failing dataset → `_queue_task_retry()` assigns the next available slot: `ach_replay_2=1`, `replay_links_ach_2=1`. Verifies that slot assignment walks correctly from index 0 to index 1.
+
+**Payload:** `ach_zero` (auto-loaded from `resources/failed_task_examples.csv`).
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-17b
+```
+Sets `ach_replay=1` (simulating a completed first retry), then imports the `ach_zero` payload to `task_data_ach_task_short_baseline`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `ach_replay` | 1 (pre-existing, unchanged) |
+| `ach_replay_2` | 1 |
+| `replay_links_ach_2` | 1 |
+| `task_data_ach_task_short_baseline` | (blank — cleared) |
+| `qc_passed` | (blank/null) |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-17b`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### BL-23b — PRL 2nd Replay Attempt (Slot 2)
+
+**What it tests:** Participant has already done one PRL retry (`prl_replay=1` is set, task data cleared), submits a second failing dataset → `prl_replay_2=1`, `replay_links_prl_2=1`.
+
+**Payload:** `prl_worse_than_chance` (auto-loaded from `resources/failed_task_examples.csv`).
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-23b
+```
+Sets `prl_replay=1`, then imports the `prl_worse_than_chance` payload to `task_data_prltask`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `prl_replay` | 1 (pre-existing, unchanged) |
+| `prl_replay_2` | 1 |
+| `replay_links_prl_2` | 1 |
+| `task_data_prltask` | (blank — cleared) |
+| `qc_passed` | (blank/null) |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-23b`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### BL-27 — Post-Verification Pass (sp_verify_pass=1)
+
+**What it tests:** Participant was previously flagged for inconsistent SP answers (`verify_emailed=1`) and the researcher has reviewed and cleared them (`sp_verify_pass=1`). The record re-enters the baseline QC queue and should pass QC normally — no re-verification triggered, `qc_passed=1`, expense sheet generated.
+
+**How it works:** `_evaluate_absurd_sp_responses()` skips records where `verify_emailed=1 AND sp_verify_pass > 0`, so none of the SP inconsistency flags are set. `_verification_needed()` therefore finds nothing to flag. The record flows through to the task checks and passes.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-27
+```
+Sets `verify_emailed=1` and `sp_verify_pass=1` on record_id=1. All other fields remain at passing clean-snapshot values.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 1 |
+| `send_pay_confirm` | 1 |
+| `verify_emailed` | 1 (pre-existing, unchanged) |
+| `sp_verify_pass` | 1 (pre-existing, unchanged) |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-27`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+**Notes:** Confirm in the console output that NO verification email note appears. An expense sheet should appear in `qc_test_drive/qc_to_dos/`. This test closes the loop on BL-10 (twice-inconsistent fail) and BL-11–15 (first-time verify path).
 
 ---
 

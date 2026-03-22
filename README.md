@@ -33,7 +33,7 @@ Run all scripts from within the `scripts/` directory.
 | `quickQC_api_calling_v7_relaunch.py` | Baseline and screening QC/payment tool |
 | `quickQC_rpt_relaunch.py` | Repeated-measures (follow-up) QC/payment tool |
 | `qc_testing_debug.py` | QC test helper — manages REDCap state for roundtrip scenario testing |
-| `qc_relaunch_testing.md` | Testing guide — all 46 test scenarios (SCR-00–18, BL-00–26) with instructions |
+| `qc_relaunch_testing.md` | Testing guide — all 57 test scenarios (SCR-00–19 + 11b/c/d, BL-00–27 + 17b/23b) with instructions |
 
 **Legacy scripts** (moved to `scripts/legacy/` — reference only, no longer in active use):
 
