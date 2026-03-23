@@ -19,7 +19,7 @@ qc_testing_debug.py verify <ID>       <- check expected fields
 qc_testing_debug.py restore           <- restore snapshot before next scenario
 ```
 
-**57 scenarios total:** SCR-00 through SCR-19 plus SCR-11b/c/d (screening) and BL-00 through BL-27 plus BL-17b/BL-23b (baseline QC).
+**62 scenarios total:** SCR-00 through SCR-24 plus SCR-11b/c/d (screening) and BL-00 through BL-27 plus BL-17b/BL-23b (baseline QC).
 
 ---
 
@@ -696,6 +696,146 @@ Sets `kaopectamine_lifetime=1` on record_id=1.
 
 **Verify:** `python3 qc_testing_debug.py verify SCR-19`
 **Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-20 — AI Prompt Injection Field Filled (flexibility_yn)
+
+**What it tests:** `flexibility_yn` is non-blank — the `@HIDDEN-SURVEY` honeypot field was filled in. Normal participants never see this field; an AI agent that reads the raw HTML may follow the embedded instruction and type something. Hard fail.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-20
+```
+Sets `flexibility_yn="ok"` on record_id=1.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail before phone verdict — you will not be asked for a phone verdict.
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "flexibility_yn") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-20`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-21 — Screening Completed Too Quickly (screen_seconds_taken < 90)
+
+**What it tests:** `screen_seconds_taken=45` — participant completed the screening survey in under 90 seconds, which is too fast for a human to read and respond. Hard fail.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-21
+```
+Sets `screen_seconds_taken=45` on record_id=1.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail before phone verdict — you will not be asked for a phone verdict.
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "screen_seconds_taken") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-21`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-22 — screen_motive Exactly 500 Characters (Length Heuristic Only)
+
+**What it tests:** `screen_motive` is exactly 500 characters but does NOT begin with the AI template phrase — fires heuristic 1 only ("response is exactly 500 characters"). Hard fail.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-22
+```
+Sets `screen_motive` to a 500-character string that does not start with "I would describe my personal motivation" (e.g., `"a" * 500`).
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail before phone verdict — you will not be asked for a phone verdict.
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "exactly 500 characters") |
+| `qc_notes` | (does NOT contain "AI template phrase") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-22`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-23 — screen_motive AI Template Phrase (Phrase Heuristic Only)
+
+**What it tests:** `screen_motive` starts with "I would describe my personal motivation" and is in the 476–524 character range, but is NOT exactly 500 characters — fires heuristic 2 only ("begins with AI template phrase"). Hard fail.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-23
+```
+Sets `screen_motive` to a 490-character string beginning with "I would describe my personal motivation" (e.g., `"I would describe my personal motivation" + "x" * 452`). Confirm `len(value) == 490`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail before phone verdict — you will not be asked for a phone verdict.
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "AI template phrase") |
+| `qc_notes` | (does NOT contain "exactly 500 characters") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-23`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### SCR-24 — screen_motive Both AI Flags Together
+
+**What it tests:** `screen_motive` starts with "I would describe my personal motivation" AND is exactly 500 characters — both heuristics fire simultaneously, and both reasons are semicolon-joined into `qc_notes`.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-24
+```
+Sets `screen_motive` to `"I would describe my personal motivation" + "x" * 462` (exactly 500 characters, starts with the template phrase). Confirm `len(value) == 500`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Note:** Hard fail before phone verdict — you will not be asked for a phone verdict.
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "exactly 500 characters") |
+| `qc_notes` | (contains "AI template phrase") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-24`
+**Reset:** `python3 qc_testing_debug.py restore`
+
+**Notes:** This is the combined case — both semicolon-joined reasons should appear in a single `qc_notes` string. Confirm the output reads like: `"screen_motive: response is exactly 500 characters; screen_motive: response is 500 chars and begins with AI template phrase"`.
 
 ---
 
