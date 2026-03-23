@@ -808,8 +808,13 @@ class RelaunchQuickQC:
     def collect_phone_verdicts(self, review: ScreeningReview) -> dict[int, str]:
         """Interactively prompt the researcher to judge each phone number in the review.
 
-        For each record in review.phone_review, prints the phone number and IP address
-        and asks the researcher to enter one of:
+        For each record in review.phone_review, prints the phone number, IP address,
+        and the participant's full screen_motive answer so the reviewer can read it
+        while checking the phone number.  If the screen_motive text triggers any of
+        the AI-generation heuristics (_screen_motive_fraud_reason), a bold red
+        ALL-CAPS warning is printed along with a link to NoGPT for paste-in detection.
+
+        Asks the researcher to enter one of:
           'y' — fraudulent or VOIP (will hard-fail the record)
           'n' — looks legitimate (will pass the record through)
           '?' — uncertain, needs Max to review (will set max_number_followup=1)
@@ -832,18 +837,25 @@ class RelaunchQuickQC:
             ip_series = review.ip_df.loc[review.ip_df["record_id"] == record_id, "ip"]
             ip_text = ip_series.iloc[0] if not ip_series.empty else "IP not found"
 
+            motive_text = string_value(row, "screen_motive").strip()
+            motive_display = motive_text if motive_text else "(no response)"
+            motive_flag = self._screen_motive_fraud_reason(motive_text)
+
+            print(f"\nRecord {record_id}")
+            print(f"  Phone:      {phone}")
+            print(f"  IP:         {ip_text}")
+            print(f"  Motivation: {motive_display}")
+
+            if motive_flag:
+                print(f"\033[1;31m  *** AI FLAG: {motive_flag.upper()} ***\033[0m")
+                print(f"\033[1;31m  *** CHECK FOR AI-GENERATED TEXT: https://www.nogpt.com ***\033[0m")
+
             while True:
-                prompt = (
-                    f"Record {record_id}\n"
-                    f"Phone: {phone}\n"
-                    f"IP: {ip_text}\n"
-                    "Enter 'y' if fraudulent/VOIP, 'n' if clear, '?' if Max should review: "
-                )
-                verdict = input(prompt).strip().lower()
+                verdict = input("  Enter 'y' if fraudulent/VOIP, 'n' if clear, '?' if Max should review: ").strip().lower()
                 if verdict in {"y", "n", "?"}:
                     verdicts[record_id] = verdict
                     break
-                print("Please enter only 'y', 'n', or '?'.")
+                print("  Please enter only 'y', 'n', or '?'.")
 
         return verdicts
 
