@@ -1042,6 +1042,7 @@ class RelaunchQuickQC:
           - Endorsed kaopectamine (fake drug trap question; kaopectamine_lifetime == '1')
           - Filled in hidden AI prompt injection field (flexibility_yn non-blank)
           - screen_motive looks AI-generated (exactly 500 chars, or 476–524 chars with template phrase)
+          - Completed screening in under 90 seconds (screen_seconds_taken < 90)
 
         SP/atypical washout check (handled separately to support willing-to-wait path):
           - sp_dayslastuse < 42 days OR atypical_recentuse == '1'
@@ -1069,6 +1070,8 @@ class RelaunchQuickQC:
                 # Hidden AI prompt injection trap: @HIDDEN-SURVEY field that asks the
                 # participant to type 'ok'; normal users never see it, AI agents may fill it
                 (string_value(row, "flexibility_yn").strip() != "", "Responded to hidden AI prompt injection field (flexibility_yn)"),
+                # Speed check: under 90 seconds is too fast for a human to read and answer
+                (0 < numeric_value(row, "screen_seconds_taken") < 90, "Completed screening suspiciously fast (screen_seconds_taken < 90s)"),
             ]
 
             # SP/atypical use within the past 6 weeks — handle separately to support the
