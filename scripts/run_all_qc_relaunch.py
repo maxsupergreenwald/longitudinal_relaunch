@@ -1,8 +1,45 @@
 #!/usr/bin/env python3
-"""Run the Aim 8 relaunch QC suite end to end.
+"""Daily wrapper that runs the full Aim 8 QC suite in one pass.
 
-This wrapper keeps the baseline/screening and repeated-measures QC engines
-separate, but gives staff one entry point for the usual daily workflow.
+PURPOSE
+-------
+This is the script you run every day.  It calls both QC engines in sequence:
+  1. quickQC_api_calling_v7_relaunch.py  — screening fraud review + baseline completion
+  2. quickQC_rpt_relaunch.py             — repeated-measures follow-up (hyp/acu/sub/pers)
+
+HOW TO RUN
+----------
+From within the scripts/ directory:
+    python3 run_all_qc_relaunch.py
+
+You will be asked for your user code (m, kayla, or gabby) and then walked through
+each step interactively.  All steps that require REDCap imports prompt for confirmation
+before pushing data.  You can skip any import without losing the local summary files.
+
+WHAT IT DOES (IN ORDER)
+------------------------
+1. Load both tools (pulls all REDCap data, checks shared-drive flags).
+2. Print a dashboard showing how many records are in each queue.
+3. Screening fraud review (if any records are waiting):
+   - Runs IP/eligibility checks automatically.
+   - Prompts for phone/VOIP verdict on each record.
+   - Offers to push screening updates to REDCap.
+4. Baseline completion QC (if any records are waiting):
+   - Runs all task and questionnaire QC automatically.
+   - Offers to push completion updates (replay links, payments, etc.) to REDCap.
+5. Repeated-measures follow-up QC (always runs):
+   - QC's all pending hyp/acu/sub/pers sessions automatically.
+   - Offers to push follow-up updates (qc_passed, payment dates, etc.) to REDCap.
+6. Prints paths to all generated files and the SharePoint payment upload URL.
+
+OUTPUT FILES (in /Volumes/psychedelics/online/qc_to_dos/YYYY-MM-DD/)
+----------------------------------------------------------------------
+  screening_review_summary.md        — screening fraud review results
+  completion_qc_summary.md           — baseline QC results
+  repeated_measures_qc_summary.md    — follow-up QC results
+  expensesheet_YYYY-MM-DD.csv        — baseline payments (upload to SharePoint)
+  expense_sheet_rpt_YYYY-MM-DD.csv   — follow-up payments (upload to SharePoint)
+  *_INCOMPLETE.txt / *_COMPLETE.txt  — flag files tracking step completion
 """
 
 from __future__ import annotations
@@ -16,6 +53,7 @@ from quickQC_rpt_relaunch import RepeatedMeasuresQuickQC
 
 
 def print_suite_dashboard(baseline_tool: RelaunchQuickQC, rpt_tool: RepeatedMeasuresQuickQC) -> None:
+    """Print a high-level count of records in all three queues across both tools."""
     print("\nAim 8 QC suite overview")
     print(f"  Screening fraud reviews: {len(baseline_tool.records_to_screen)}")
     print(f"  Baseline completions waiting for QC/payment: {len(baseline_tool.records_to_check)}")
@@ -26,6 +64,7 @@ def print_suite_dashboard(baseline_tool: RelaunchQuickQC, rpt_tool: RepeatedMeas
 
 
 def main() -> None:
+    """Entry point for the daily QC run.  Runs screening, baseline, and follow-up in order."""
     user_code = input("Who is using the QC suite? m, kayla, or gabby? ").strip().lower()
 
     baseline_tool = RelaunchQuickQC(user_code).load()

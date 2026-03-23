@@ -1,18 +1,105 @@
 #!/usr/bin/env python3
-"""Baseline + screening QC tool for the Aim 8 relaunch project.
+"""Baseline + screening QC tool for the Aim 8 serotonergic psychedelics relaunch project.
 
-This script is a readable replacement for the old
-`quickQC_api_calling_v6_OnlyLongitudinal.ipynb` baseline notebook.
+PURPOSE
+-------
+This script handles two distinct review queues that arise during daily data collection:
 
-Scope of this draft:
-- handle new screening records that need fraud review before `screening_pass`
-- handle newly completed baseline records that need QC and payment export
-- preserve the baseline ACH / VCH / PRL QC logic from the old notebook
-- remove Yale, cannabis, old longitudinal-waiting, and non-Amazon payment paths
+1. SCREENING FRAUD REVIEW
+   New participants complete the screening survey (consent → screening_survey →
+   screening_result) and submit via `submit_screen_v3`.  Before we can call them
+   eligible and invite them to the baseline session, we need to verify they are real,
+   US-based people who are not duplicating a prior attempt.  This script:
+     - Checks hard exclusion criteria (age, cognition, seizure history, etc.)
+     - Checks for fake-drug endorsement (kaopectamine trap question)
+     - Checks for SP/atypical use within 42 days and routes willing-to-wait participants
+       to the `eligible_afterwait_notify` path instead of immediate `eligible_notify`
+     - Cross-references IP address against a curated blocklist and prior-record history
+     - Prompts the researcher to manually verify each phone number / VOIP check
+     - Writes screening_pass, eligible_notify (or eligible_afterwait_notify), and
+       ineligibile_fraud back to REDCap
 
-Still intentionally out of scope for this draft:
-- per-timepoint follow-up QC/payment after hyperacute / acute / subacute / persisting
-- full replacement of every legacy admin alert/template field
+2. BASELINE COMPLETION QC
+   Participants who have passed screening and completed all baseline instruments
+   (surveys + ACH + VCH + PRL tasks) land in a second queue.  This script:
+     - Runs task-level QC on ACH, VCH, and PRL data (slope, zero-detection,
+       first-15-trial, copy-paste duplicate checks)
+     - Checks attention checks, race/age consistency, and trap/fraud questions
+       (kaopectamine, fraud_caps, fraud_pdi, fraud_recent_dose)
+     - Evaluates SP use responses for internal consistency (illogical counts,
+       wrong most-recent type, implausible routes of administration)
+     - Routes failed-task records into replay slots (up to 4 per task) rather than
+       rejecting them outright
+     - Routes suspicious-SP records to a manual verification email flow
+       (verify_emailed=1) and re-evaluates them once sp_verify_pass is set
+     - Writes qc_passed, qc_notes, replay_links_*, and payment info to REDCap
+     - Generates an expense-sheet CSV ready for SharePoint upload
+
+TYPICAL DAILY WORKFLOW
+----------------------
+Run this from within the scripts/ directory via `run_all_qc_relaunch.py`, which
+calls both this script and quickQC_rpt_relaunch.py in one pass.  You can also
+run this file directly:
+
+    python3 quickQC_api_calling_v7_relaunch.py
+
+Or import the class in a Jupyter notebook / the testing helper:
+
+    from quickQC_api_calling_v7_relaunch import RelaunchQuickQC
+    tool = RelaunchQuickQC("m").load()
+
+METHOD CALL ORDER
+-----------------
+Screening path:
+    tool.load()
+    review  = tool.prepare_screening_review()   # builds ScreeningReview
+    verdicts = tool.collect_phone_verdicts(review)
+    updates  = tool.build_screening_updates(review, verdicts)
+    tool.import_screening_updates(updates)      # pushes to REDCap
+
+Baseline completion path:
+    completion = tool.run_completion_qc()       # builds CompletionReview
+    tool.import_completion_updates(completion)  # pushes to REDCap
+
+KEY CONFIGURATION (top of this file)
+--------------------------------------
+    RELAUNCH_API_TOKEN      — REDCap API token for the merged Aim 8 project
+    IPINFO_TOKEN            — ipinfo.io token for IP geolocation lookups
+    SHAREDDRIVE_NETWORK_PATH — mount point for /Volumes/psychedelics/online
+    IP_DATABASE_PATH        — ips/ips_full.csv on the shared drive
+    FAILED_JSON_PATH        — jsons/failed_task_jsons_baseline.csv
+    FORBIDDEN_IP_ORGS/COUNTRIES — automatic hard-fail IP blocklist
+    SCREENING_EMAIL_FIELDS  — fields checked for duplicate email addresses
+    BASELINE_DATE_FIELDS    — fields used to pick the latest completion date
+
+KEY REDCAP FIELDS WRITTEN BY THIS SCRIPT
+-----------------------------------------
+Screening:
+    screening_pass          — 1 = cleared fraud review; 0 = ineligible
+    qc_passed               — 0 = hard fail; blank = not yet reviewed
+    eligible_notify         — 1 = triggers immediate baseline invitation alert
+    eligible_afterwait_notify — 1 = triggers invitation alert at continue_date
+                               (for participants who used SP within last 42 days
+                                but are willing to wait)
+    ineligibile_fraud       — 1 = flagged as fraudulent
+    ip_zoom_invite          — 1 = suspicious IP, needs Zoom verification
+    max_number_followup     — 1 = needs manual follow-up by Max
+    qc_notes                — free-text reason for ineligibility
+    ineligibilty_reason     — free-text reason (separate legacy field)
+
+Baseline completion:
+    qc_passed               — 1 = passed; 0 = failed
+    qc_notes                — failure or verification reason
+    verify_emailed          — 1 = sent SP verification survey
+    inconsistent_sp_answers — 1 = flagged for inconsistent SP responses
+    fraudulent_email        — 1 = copy-paste fraud detected
+    fraudulent_email_inconsistentanswers — 1 = absurd SP responses
+    replay_links_ach/vch/prl     — 1 = triggers replay invitation alert (slot 1)
+    replay_links_ach_2/3/4  — slots 2–4 for subsequent replay attempts
+    fourth_fail             — 1 = all 4 replay slots exhausted
+    send_pay_confirm        — 1 = triggers payment confirmation alert
+    employee_name           — staff member who ran QC
+    pay_day_ofweek          — day of week (1=Mon…7=Sun) payment was queued
 """
 
 from __future__ import annotations
@@ -133,6 +220,36 @@ BASELINE_DATE_FIELDS = [
 
 @dataclass
 class ScreeningReview:
+    """All data and categorised record lists produced by prepare_screening_review().
+
+    After prepare_screening_review() runs, every record in records_to_screen will
+    appear in exactly one of: hard_fail, phone_review, or sp_wait.
+    Records may additionally appear in suspicious_ip or manual_followup.
+
+    Attributes
+    ----------
+    records_to_screen   : record IDs pulled from the screening queue (submit_screen_v3
+                          filled, screening_pass blank, qc_passed blank).
+    screen_df           : REDCap data subset for just these records.
+    ip_df               : IP-address metadata from ips_full.csv, one row per record.
+    hard_fail           : Records that failed an automatic rule (age, cognition, fake
+                          drug, forbidden IP, duplicate email, etc.).  Will receive
+                          screening_pass=0 and ineligibile_fraud=1.
+    suspicious_ip       : Records whose IP matches a previously-reviewed / ineligible
+                          record.  Will receive ip_zoom_invite=1 for Zoom verification.
+    phone_review        : Records that passed all automatic checks and need a human
+                          to look up the phone number for VOIP detection.
+    manual_followup     : Records that could not be auto-resolved (e.g. missing IP).
+                          Will receive max_number_followup=1.
+    sp_wait             : Records that used SP/atypical psychedelics within 42 days but
+                          answered psychedelic_abstinence_yn='1' (willing to wait).
+                          These go through the normal phone review; if cleared they get
+                          screening_pass=1 and eligible_afterwait_notify=1 (not
+                          eligible_notify), deferring the invitation to continue_date.
+    ineligibility_notes : {record_id: reason string} for every record with a failure
+                          reason.  Written to qc_notes on hard-fail records.
+    """
+
     records_to_screen: list[int]
     screen_df: pd.DataFrame
     ip_df: pd.DataFrame
@@ -146,6 +263,23 @@ class ScreeningReview:
 
 @dataclass
 class CompletionReview:
+    """All data and results produced by run_completion_qc().
+
+    Attributes
+    ----------
+    records_to_check        : Record IDs that were reviewed in this run.
+    update_df               : DataFrame of REDCap field updates ready to import.
+                              One row per record; columns are the fields to write.
+    update_fields           : Column names in update_df (excluding record_id).
+    expensesheet_path       : Path to the generated expense-sheet CSV, or None if no
+                              records passed QC and needed payment.
+    failed_json_append_count: Number of failed-task JSON rows appended to
+                              FAILED_JSON_PATH on the shared drive.
+    qc_lists                : Dict of named lists identifying which records triggered
+                              each QC flag (e.g. 'zero', 'negative', 'failed_sp_qc').
+                              Printed to the completion summary markdown.
+    """
+
     records_to_check: list[int]
     update_df: pd.DataFrame
     update_fields: list[str]
@@ -160,10 +294,12 @@ class CompletionReview:
 
 
 def ask_yes_no(prompt: str) -> bool:
+    """Prompt the researcher with a yes/no question; return True only if they type 'yes'."""
     return input(prompt).strip().lower() == "yes"
 
 
 def clean_email(value: Any) -> str | None:
+    """Normalise an email value from a REDCap cell to a lowercase string, or None if blank."""
     if pd.isna(value):
         return None
     email = str(value).strip().lower()
@@ -171,6 +307,12 @@ def clean_email(value: Any) -> str | None:
 
 
 def numeric_value(row: pd.Series, field: str) -> float:
+    """Safely read a numeric field from a DataFrame row.
+
+    Returns np.nan if the field is absent, NaN, or cannot be cast to float.
+    This prevents KeyErrors and type errors when a REDCap field may not be
+    present in the export (e.g. if it was added after an older export was cached).
+    """
     if field not in row.index:
         return np.nan
     value = row[field]
@@ -183,22 +325,43 @@ def numeric_value(row: pd.Series, field: str) -> float:
 
 
 def string_value(row: pd.Series, field: str) -> str:
+    """Safely read a string field from a DataFrame row.
+
+    Returns an empty string if the field is absent or NaN, so callers can do
+    simple equality checks (e.g. string_value(row, 'x') == '1') without
+    special-casing missing data.
+    """
     if field not in row.index or pd.isna(row[field]):
         return ""
     return str(row[field]).strip()
 
 
 def add_reason(reason_map: dict[int, str], record_id: int, reason: str) -> None:
+    """Append a human-readable ineligibility reason to the running notes for a record.
+
+    Reasons are semicolon-separated so that a record with multiple failures has a
+    single, legible string written to qc_notes.
+    """
     existing = reason_map.get(record_id, "")
     combined = f"{existing}; {reason}" if existing else reason
     reason_map[record_id] = combined
 
 
 def field_exists(df: pd.DataFrame, field: str) -> bool:
+    """Return True if `field` is a column in `df`.
+
+    Used as a lightweight guard before writing to optional REDCap fields that may
+    not be present in older project exports.
+    """
     return field in df.columns
 
 
 def to_int_list(values: list[Any]) -> list[int]:
+    """Convert a list of possibly-NaN / mixed-type values to a clean list of ints.
+
+    NaN values and anything that can't be cast to int are silently dropped.
+    Used throughout to sanitise record_id columns from pandas Series.
+    """
     cleaned: list[int] = []
     for value in values:
         if pd.isna(value):
@@ -211,6 +374,12 @@ def to_int_list(values: list[Any]) -> list[int]:
 
 
 def nonempty_task_value(row: pd.Series, primary_field: str, backup_field: str | None = None) -> bool:
+    """Return True if a task payload field contains a non-empty string.
+
+    Checks primary_field first; falls back to backup_field (the manually-retrieved
+    JSON field, e.g. task_data_ach_bl_retrieved) if the primary is empty.
+    Used to test whether a task record has usable data before running QC.
+    """
     if primary_field in row.index and isinstance(row[primary_field], str) and row[primary_field].strip():
         return True
     if backup_field and backup_field in row.index and isinstance(row[backup_field], str) and row[backup_field].strip():
@@ -219,6 +388,12 @@ def nonempty_task_value(row: pd.Series, primary_field: str, backup_field: str | 
 
 
 def latest_completion_date(row: pd.Series, date_fields: list[str]) -> str:
+    """Return the most recent non-empty date among a list of REDCap date fields.
+
+    Used to find the 'Date of Participation' for the expense sheet — we pick the
+    latest instrument completion date rather than a single hard-coded field.
+    Returns today's date (MM/DD/YYYY) if no valid date is found.
+    """
     parsed_dates: list[datetime] = []
     for field in date_fields:
         value = string_value(row, field)
@@ -235,6 +410,13 @@ def latest_completion_date(row: pd.Series, date_fields: list[str]) -> str:
 
 
 def parse_redcap_pdf_log(log_string: str) -> pd.DataFrame:
+    """Parse the REDCap PDF archive log text into a DataFrame of (record_id, ip) pairs.
+
+    The researcher pastes rows from the REDCap Logging page (PDF archive view).
+    Each row contains a record ID and the IP address used to submit the e-Consent.
+    Returns a DataFrame with columns ['record_id', 'ip'].
+    Raises ValueError if record/IP counts don't align (malformed paste).
+    """
     record_matches = re.findall(r"(\d+)\s*\t(?:Consent|e-Consent)", log_string)
     ip_matches = re.findall(
         r"\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?\s+(\d{1,3}(?:\.\d{1,3}){3})\s*\t1\t\s*e-Consent",
@@ -252,12 +434,19 @@ def parse_redcap_pdf_log(log_string: str) -> pd.DataFrame:
 
 
 def decode_compressed_json(compressed_string: str) -> dict[str, Any]:
+    """Decompress and parse a gzip+base64 encoded JSON string.
+
+    The ACH, VCH, and PRL task payloads are stored in REDCap as base64-encoded
+    gzip-compressed JSON strings to fit within REDCap's field size limits.
+    This function reverses that encoding to get back the raw task data dict.
+    """
     decoded = base64.b64decode(compressed_string)
     decompressed = gzip.decompress(decoded).decode("utf-8")
     return json.loads(decompressed)
 
 
 def ensure_directory(path: Path) -> None:
+    """Create a directory (and any missing parents) if it does not already exist."""
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -268,6 +457,32 @@ def ensure_directory(path: Path) -> None:
 
 @dataclass
 class TaskConfig:
+    """Static configuration for one of the three baseline tasks (ACH, VCH, PRL).
+
+    One instance of this class lives in TASK_CONFIGS for each task.  The QC engine
+    reads these to know which REDCap fields to inspect, reset, and write back.
+
+    Attributes
+    ----------
+    task_col            : Primary REDCap field that holds the compressed task payload
+                          (e.g. 'task_data_ach_task_short_baseline').
+    backup_col          : Fallback field holding a manually-retrieved JSON string if the
+                          primary field is empty (e.g. 'task_data_ach_bl_retrieved').
+    qualifying_cols     : Fields that get stamped with an HTML 'Incomplete' message when
+                          a task fails, prompting the participant to redo the task.
+    replay_fields       : REDCap yesno fields that track how many replay attempts have
+                          been issued ('ach_replay', 'ach_replay_2', …, 'ach_replay_4').
+                          The first unfilled slot is set to 1 on each failure.
+    template_fields     : Parallel list of fields that trigger the replay invitation
+                          alert for each slot ('replay_links_ach', 'replay_links_ach_2',
+                          …).  Set to 1 alongside the matching replay_field.
+    failure_conditions  : Names of qc_lists keys (from _evaluate_ch_task /
+                          _evaluate_prl) that count as a failure requiring replay.
+    reset_cols          : Fields to clear (set to NaN) when queuing a replay, so the
+                          participant can re-do the headphone/browser checks and submit
+                          a fresh payload.
+    """
+
     task_col: str
     backup_col: str
     qualifying_cols: list[str]
@@ -353,6 +568,22 @@ TASK_CONFIGS = {
 
 
 class RelaunchQuickQC:
+    """Main QC engine for the Aim 8 baseline and screening review workflow.
+
+    Instantiate with the researcher's user code, call load() to pull data from
+    REDCap, then run the screening and/or completion review.  See module docstring
+    for the full call sequence.
+
+    Instance attributes set by load():
+        project         — PyCap Project object (authenticated REDCap connection)
+        df              — Full REDCap export as a cleaned DataFrame
+        df_og           — Copy of df at load time, used as a clean base for updates
+        metadata        — REDCap metadata (field labels, types) — currently unused
+        records_to_screen — IDs in the screening fraud queue
+        records_to_check  — IDs in the baseline completion queue
+        date_directory  — Path to today's QC_TODO_PATH/YYYY-MM-DD subfolder
+    """
+
     def __init__(self, user_code: str):
         user_key = user_code.strip().lower()
         if user_key not in USER_NAMES:
@@ -374,6 +605,17 @@ class RelaunchQuickQC:
     # ------------------------------------------------------------------
 
     def load(self) -> "RelaunchQuickQC":
+        """Pull data from REDCap, populate both review queues, and return self.
+
+        Steps:
+        1. Abort if the shared drive has any unresolved INCOMPLETE flag files from
+           a prior QC session (prevents concurrent / double-processing).
+        2. Export all records from REDCap and clean the DataFrame.
+        3. Identify which records need screening review vs. baseline completion review.
+
+        Must be called before any other method.  Returns self for chaining:
+            tool = RelaunchQuickQC("m").load()
+        """
         self._check_incomplete_flags(QC_TODO_PATH)
         ensure_directory(self.date_directory)
 
@@ -388,6 +630,7 @@ class RelaunchQuickQC:
         return self
 
     def print_dashboard(self) -> None:
+        """Print a one-line summary of how many records are in each queue."""
         print(f"Loaded Aim 8 relaunch QC as {self.user_name}")
         print(f"Screening records waiting for fraud review: {len(self.records_to_screen)}")
         print(f"Completed baseline records waiting for QC/payment: {len(self.records_to_check)}")
@@ -395,6 +638,12 @@ class RelaunchQuickQC:
             print("Nothing to do today.")
 
     def _clean_export(self, raw_df: pd.DataFrame) -> pd.DataFrame:
+        """Standardise the raw REDCap export before any QC logic runs.
+
+        - Drops string-based test records (BlueLightTesting_1, TESTING, etc.)
+        - Coerces record_id to integer and drops non-numeric rows
+        - Drops two specific legacy records hard-coded to exclude (IDs 456 and 654)
+        """
         df = raw_df.copy()
 
         if df["record_id"].dtype == object:
@@ -405,18 +654,21 @@ class RelaunchQuickQC:
         df = df.loc[df["record_id"].notna()].copy()
         df["record_id"] = df["record_id"].astype(int)
 
-        if "replay_email" in df.columns:
-            df["replay_email"] = df["replay_email"].fillna("NO EMAIL GIVEN")
-
-        if "student_yn" in df.columns:
-            df["student_yn"] = pd.to_numeric(df["student_yn"], errors="coerce").fillna(0).astype(int)
-
         # Old hard-coded exclusions carried over from the notebook reference.
         df = df.loc[~df["record_id"].isin({456, 654})].copy()
 
         return df.reset_index(drop=True)
 
     def _identify_screening_records(self) -> list[int]:
+        """Return record IDs that are ready for the screening fraud review queue.
+
+        A record enters the screening queue when ALL of the following are true:
+          - submit_screen_v3 is filled (participant submitted the screening survey)
+          - screening_pass is blank (not yet reviewed)
+          - qc_passed is blank (not previously hard-failed at baseline)
+          - phone_number is filled (we have a number to look up)
+          - ip_zoom_invite is blank (not already flagged for Zoom verification)
+        """
         assert self.df is not None
         df = self.df
 
@@ -433,6 +685,18 @@ class RelaunchQuickQC:
         return to_int_list(df.loc[needed, "record_id"].tolist())
 
     def _identify_completed_baseline_records(self) -> list[int]:
+        """Return record IDs that are ready for baseline completion QC and payment.
+
+        A record enters this queue when ALL of the following are true:
+          - qc_passed is blank (not yet reviewed or hard-failed)
+          - screening_pass > 0 (cleared the fraud review)
+          - race_qc is filled (the second-pass demographics survey is done)
+          - ACH, VCH, and PRL task fields are non-empty (tasks were submitted)
+          - NOT currently waiting for SP verification
+            (verify_emailed=1 AND sp_verify_pass blank means we're waiting on the
+             participant to fill out the clarification survey; we skip them until
+             sp_verify_pass is set by the researcher)
+        """
         assert self.df is not None
         df = self.df.copy()
 
@@ -456,6 +720,15 @@ class RelaunchQuickQC:
         return to_int_list(df.loc[ready_mask, "record_id"].tolist())
 
     def _check_incomplete_flags(self, base_path: Path) -> None:
+        """Block the QC run if there are unresolved INCOMPLETE flags from a prior session.
+
+        After each QC run, flag files are written to QC_TODO_PATH/YYYY-MM-DD/ to track
+        whether expense sheets have been uploaded and whether manual tasks (replay emails,
+        fraud follow-ups) have been completed.  If a previous session left behind an
+        INCOMPLETE flag, we must not run a new QC pass until that session is resolved —
+        otherwise we risk double-paying or missing a manual step.
+        Raises RuntimeError listing the unresolved flags and who left them.
+        """
         if not base_path.exists():
             raise RuntimeError(
                 "The shared drive QC folder was not found. Mount "
@@ -490,6 +763,17 @@ class RelaunchQuickQC:
     # ------------------------------------------------------------------
 
     def prepare_screening_review(self) -> ScreeningReview:
+        """Build a ScreeningReview for all records currently in the screening queue.
+
+        Loads the IP database, then runs two passes over the screening records:
+          1. _apply_screening_eligibility_rules — checks hard exclusion criteria and the
+             SP/atypical washout period; populates hard_fail and sp_wait.
+          2. _apply_duplicate_identity_checks — cross-references IPs and emails against
+             historical records; populates hard_fail, suspicious_ip, and manual_followup.
+
+        All remaining records (not in hard_fail) are added to phone_review.
+        Writes a markdown summary to today's date directory and returns the review object.
+        """
         assert self.df is not None
         records = self.records_to_screen
         if not records:
@@ -522,6 +806,17 @@ class RelaunchQuickQC:
         return review
 
     def collect_phone_verdicts(self, review: ScreeningReview) -> dict[int, str]:
+        """Interactively prompt the researcher to judge each phone number in the review.
+
+        For each record in review.phone_review, prints the phone number and IP address
+        and asks the researcher to enter one of:
+          'y' — fraudulent or VOIP (will hard-fail the record)
+          'n' — looks legitimate (will pass the record through)
+          '?' — uncertain, needs Max to review (will set max_number_followup=1)
+
+        Returns a dict of {record_id: verdict} for all reviewed records.
+        Records in hard_fail are skipped — they already have a verdict.
+        """
         assert self.df is not None
 
         verdicts: dict[int, str] = {}
@@ -553,6 +848,23 @@ class RelaunchQuickQC:
         return verdicts
 
     def build_screening_updates(self, review: ScreeningReview, phone_verdicts: dict[int, str]) -> pd.DataFrame:
+        """Translate the ScreeningReview and phone verdicts into a REDCap update DataFrame.
+
+        Routing logic:
+          hard_fail / phone verdict 'y' → screening_pass=0, qc_passed=0,
+                                          ineligibile_fraud=1, qc_notes=reason
+          sp_wait + phone verdict 'n'   → screening_pass=1,
+                                          eligible_afterwait_notify=1
+                                          (invitation scheduled at continue_date)
+          normal pass (phone verdict 'n', not sp_wait) → screening_pass=1,
+                                          eligible_notify=1
+                                          (invitation sent immediately)
+          suspicious_ip                 → ip_zoom_invite=1 (Zoom call required)
+          phone verdict '?' or no IP    → max_number_followup=1
+
+        Returns a filtered DataFrame containing only the fields that exist in the
+        REDCap export, ready to pass to import_screening_updates().
+        """
         assert self.df is not None
 
         updates = self.df.loc[self.df["record_id"].isin(review.records_to_screen)].copy()
@@ -628,6 +940,12 @@ class RelaunchQuickQC:
         return updates
 
     def import_screening_updates(self, updates: pd.DataFrame) -> None:
+        """Push the screening update DataFrame to REDCap and mark the flag as complete.
+
+        Imports the update DataFrame produced by build_screening_updates().
+        After a successful import, converts the REDCAP_SCREENS_INCOMPLETE flag file to
+        REDCAP_SCREENS_COMPLETE so the shared-drive flag system reflects completion.
+        """
         assert self.project is not None
         if updates.empty:
             print("No screening updates to import.")
@@ -637,6 +955,14 @@ class RelaunchQuickQC:
         print(f"Imported screening updates for {len(updates)} records.")
 
     def _load_and_update_ip_database(self, records_to_screen: list[int]) -> pd.DataFrame:
+        """Load ips_full.csv from the shared drive; fetch metadata for any new records.
+
+        For each record that is not yet in the IP database, prompts the researcher to
+        paste the REDCap PDF archive rows containing the IP address, then queries
+        ipinfo.io for geolocation and ISP metadata and appends to the CSV.
+        Returns the full (updated) ip_df with all screening records present.
+        Raises RuntimeError if the shared drive is not mounted.
+        """
         if not IP_DATABASE_PATH.exists():
             raise RuntimeError(f"IP database was not found at {IP_DATABASE_PATH}")
 
@@ -685,6 +1011,33 @@ class RelaunchQuickQC:
         return merged
 
     def _apply_screening_eligibility_rules(self, review: ScreeningReview) -> None:
+        """Apply hard exclusion criteria and SP washout logic to each screening record.
+
+        For each record, evaluates a list of boolean exclusion checks.  Any that fire
+        add a human-readable reason to review.ineligibility_notes and append the record
+        to review.hard_fail.
+
+        Hard exclusion checks (all lead to hard_fail regardless of willingness to wait):
+          - Age < 18 or > 65
+          - Cognitive screener failed (cognition_screener_v2 > 0)
+          - Seizure history (seizure_hx_v2 > 0)
+          - Possible intoxication (intox_screen_v2 > 0)
+          - Did not endorse SP use (psycheduse_yn > 1)
+          - Raven score < 1
+          - No computer access (no_computer > 0)
+          - English fluency not met (english_fluency < 1)
+          - Geographic fraud flag (geo_crit is NaN)
+          - Endorsed kaopectamine (fake drug trap question; kaopectamine_lifetime == '1')
+          - Filled in hidden AI prompt injection field (flexibility_yn non-blank)
+          - screen_motive looks AI-generated (exactly 500 chars, or 476–524 chars with template phrase)
+
+        SP/atypical washout check (handled separately to support willing-to-wait path):
+          - sp_dayslastuse < 42 days OR atypical_recentuse == '1'
+          → If psychedelic_abstinence_yn == '1' (willing to wait): added to sp_wait
+          → Otherwise: added to hard_fail with a washout reason
+
+        Mutates review in-place; does not return anything.
+        """
         for _, row in review.screen_df.iterrows():
             record_id = int(row["record_id"])
 
@@ -701,6 +1054,9 @@ class RelaunchQuickQC:
                 (pd.isna(row.get("geo_crit", np.nan)), "Geographic fraud flag"),
                 # Fake drug trap question checked at screening stage
                 (string_value(row, "kaopectamine_lifetime").strip() == "1", "Endorsed fake drug (kaopectamine) during screening"),
+                # Hidden AI prompt injection trap: @HIDDEN-SURVEY field that asks the
+                # participant to type 'ok'; normal users never see it, AI agents may fill it
+                (string_value(row, "flexibility_yn").strip() != "", "Responded to hidden AI prompt injection field (flexibility_yn)"),
             ]
 
             # SP/atypical use within the past 6 weeks — handle separately to support the
@@ -727,7 +1083,29 @@ class RelaunchQuickQC:
                     add_reason(review.ineligibility_notes, record_id, reason)
                     review.hard_fail.append(record_id)
 
+            # screen_motive: flag AI-generated motivational text responses.
+            # Per-record reason is built by _screen_motive_fraud_reason (length/phrase heuristics).
+            motive_reason = self._screen_motive_fraud_reason(string_value(row, "screen_motive").strip())
+            if motive_reason:
+                add_reason(review.ineligibility_notes, record_id, motive_reason)
+                review.hard_fail.append(record_id)
+
     def _apply_duplicate_identity_checks(self, review: ScreeningReview) -> None:
+        """Cross-reference new screening records against historical IPs and emails.
+
+        Builds a set of 'historic' records — anyone who previously screened (whether
+        eligible or not) — then checks each new record for:
+
+          1. Forbidden IP org / country: IP is from FORBIDDEN_IP_ORGS or
+             FORBIDDEN_IP_COUNTRIES → hard_fail.
+          2. Duplicate email: any email field (SCREENING_EMAIL_FIELDS) matches an email
+             in the historic record set → hard_fail.
+          3. IP shared with a historic record: IP matches a prior record's IP (excluding
+             known safe orgs like Yale and Middlebury) → suspicious_ip.
+          4. Missing IP metadata: record is not in the IP database at all → manual_followup.
+
+        Mutates review in-place.
+        """
         assert self.df is not None
         df = self.df
 
@@ -782,6 +1160,13 @@ class RelaunchQuickQC:
                 add_reason(review.ineligibility_notes, record_id, "IP matches a previously reviewed/ineligible record")
 
     def _write_screening_summary(self, review: ScreeningReview) -> None:
+        """Write a markdown summary of the screening review to today's date directory.
+
+        Saved as screening_review_summary.md.  Lists counts for each category and
+        all ineligibility reasons by record ID.  Useful for a paper trail and for
+        anyone who needs to understand why a record was flagged without re-running
+        the script.
+        """
         summary_path = self.date_directory / "screening_review_summary.md"
         lines = [
             "# Screening Review Summary",
@@ -808,6 +1193,32 @@ class RelaunchQuickQC:
     # ------------------------------------------------------------------
 
     def run_completion_qc(self) -> CompletionReview:
+        """Run all baseline QC checks and build the REDCap update DataFrame.
+
+        Processes every record in self.records_to_check through the following pipeline
+        (in order of priority — the first applicable outcome wins for each record):
+
+          1. Critical failure → qc_passed=0, qc_notes=reason
+             Triggered by: failed attention check, race/age mismatch, failed trap
+             questions (kaopectamine/dose/caps/pdi), copy-pasted task data, or
+             confirmed absurd SP responses (sp_verify_pass set to 0 after verification).
+
+          2. SP verification needed → verify_emailed=1, inconsistent_sp_answers=1
+             Triggered by: internally inconsistent SP use responses that are suspicious
+             but could be genuine errors.  Sends the clarification survey; record will
+             be re-evaluated on the next QC run once sp_verify_pass is set.
+
+          3. Task replay needed → ach/vch/prl_replay_N=1, replay_links_*=1
+             Triggered by: task failure (zero/negative slope, first-15 failure for CH;
+             worse-than-chance / non-responder for PRL).  Clears the task field and
+             sends a replay invitation alert.  Up to 4 replay attempts per task.
+
+          4. QC passed → qc_passed=1, expense sheet row generated
+
+        Also appends failed task JSON payloads to FAILED_JSON_PATH on the shared drive
+        for offline analysis.  Writes a completion_qc_summary.md.
+        Returns a CompletionReview with the update DataFrame and expense sheet path.
+        """
         assert self.df is not None and self.df_og is not None
 
         records = self.records_to_check
@@ -885,7 +1296,6 @@ class RelaunchQuickQC:
             "illogical_life": to_int_list(sp_findings["illogical_life"]),
             "wrong_recent": to_int_list(sp_findings["wrong_recent"]),
             "nanresponses": to_int_list(sp_findings["nanresponses"]),
-            "nanresponses_screen": to_int_list(sp_findings["nanresponses_screen"]),
             "no_sms_verification": to_int_list(no_sms_verification),
             "nosurvey1": to_int_list(no_main_survey),
             "no_ach": to_int_list(no_ach),
@@ -995,6 +1405,13 @@ class RelaunchQuickQC:
         )
 
     def import_completion_updates(self, review: CompletionReview) -> None:
+        """Push the baseline completion update DataFrame to REDCap.
+
+        Coerces float columns that contain only whole numbers to Int64 before import
+        (REDCap rejects floats like 1.0 for integer/yesno fields).
+        Uses overwrite='overwrite' so task payload fields can be cleared for replays.
+        Marks the REDCAP_FULLRECORDS_INCOMPLETE flag as complete after a successful push.
+        """
         assert self.project is not None
         if review.update_df.empty:
             print("No completion updates to import.")
@@ -1018,21 +1435,57 @@ class RelaunchQuickQC:
     # ------------------------------------------------------------------
 
     def _find_failed_attention_checks(self, df_raw: pd.DataFrame) -> list[int]:
-        attn_fields = ["attn_check_surveybl", "attn_check_surveybl2", "attn_check_surveybl3", "attn_check_surveybl4"]
+        """Return record IDs that failed one or more embedded attention checks.
+
+        Checks attn_check_surveybl, attn_check_surveybl2, and attn_check_surveybl3.
+        Each is a yesno field where the correct answer is 1 (Yes).  A record fails
+        if the sum of existing checks is less than the number of existing check fields
+        (i.e., they got at least one wrong).  Only checks fields present in the export
+        to handle cases where a field does not yet exist in REDCap.
+        """
+        attn_fields = ["attn_check_surveybl", "attn_check_surveybl2", "attn_check_surveybl3"]
         existing = [field for field in attn_fields if field in df_raw.columns]
         if not existing:
             return []
         totals = df_raw[existing].apply(pd.to_numeric, errors="coerce").sum(axis=1)
         return to_int_list(df_raw.loc[totals < len(existing), "record_id"].tolist())
 
+    def _screen_motive_fraud_reason(self, text: str) -> str | None:
+        """Return a fraud reason if screen_motive looks AI-generated, else None.
+
+        Two heuristics target AI agents that follow the prompt literally:
+          1. Length is exactly 500 characters — AI commonly targets the exact count
+             asked for when given a numeric target ("500 characters").
+          2. Length is 476–524 characters AND begins with the template phrase
+             "I would describe my personal motivation" — catches responses that
+             echo the question wording back verbatim while hitting the ~500 target.
+
+        Multiple matching reasons are semicolon-joined so both can appear in qc_notes.
+        Returns None if no heuristic fires (i.e., the response looks human).
+        """
+        if not text:
+            return None
+        n = len(text)
+        reasons: list[str] = []
+        if n == 500:
+            reasons.append("screen_motive: response is exactly 500 characters")
+        if 476 <= n <= 524 and text.startswith("I would describe my personal motivation"):
+            reasons.append(f"screen_motive: response is {n} chars and begins with AI template phrase")
+        return "; ".join(reasons) if reasons else None
+
     def _find_trap_question_failures(self, df_raw: pd.DataFrame) -> list[int]:
-        """Flag records that fail any trap / fraud-detection check:
+        """Flag records that fail any of the embedded fraud/trap checks at baseline.
+
+        This is distinct from the screening-stage kaopectamine check: here we check
+        records that have already passed screening and completed the baseline battery.
+
+        Checks (all lead to critical failure — qc_passed=0):
         - kaopectamine_lifetime == '1'  (fake drug endorsed — radio field, Yes=1)
         - fraud_recent_dose == '1'           (dose self-report doesn't match computed most-recent dose)
         - fraud_caps == '0'                  (missed embedded CAPS attention check — correct answer is Yes/1)
         - fraud_pdi == '0'                   (missed embedded PDI attention check — correct answer is Yes/1)
-        A record is flagged (full fraud response) if kaopectamine or dose mismatch OR if either
-        attention check was answered incorrectly (answered No).
+        - ai_copy_paste == '1' or '3'        (disagreed with no-copy-paste policy, or self-declared as AI)
+        A record is flagged if any single check fires.
         """
         failures: set[int] = set()
 
@@ -1057,9 +1510,23 @@ class RelaunchQuickQC:
             mask = df_raw["fraud_pdi"].astype(str).str.strip() == "0"
             failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
 
+        # ai_copy_paste: radio — 2 (I agree) is the only valid response.
+        # 1 = disagrees with no-copy-paste policy; 3 = self-declared AI agent.
+        if "ai_copy_paste" in df_raw.columns:
+            mask = df_raw["ai_copy_paste"].astype(str).str.strip().isin(["1", "3"])
+            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+
         return [int(r) for r in sorted(failures)]
 
     def _find_race_age_mismatch(self, df_raw: pd.DataFrame) -> list[int]:
+        """Return record IDs where the race or age answer changed between screening and baseline.
+
+        Participants report race (race_v2) and age (age_v2) during screening, then
+        confirm them again in a later instrument (race_qc, age_qc).  Large discrepancies
+        suggest the baseline was filled out by a different person than screening.
+        A record fails if: |race_v2 - race_qc| > 1, OR |age_v2 - age_qc| > 1,
+        OR both differ by any amount simultaneously.
+        """
         required = {"race_qc", "race_v2", "age_qc", "age_v2"}
         if not required.issubset(df_raw.columns):
             return []
@@ -1078,6 +1545,38 @@ class RelaunchQuickQC:
         return failures
 
     def _evaluate_absurd_sp_responses(self, df_raw: pd.DataFrame) -> dict[str, Any]:
+        """Evaluate the internal consistency and plausibility of SP use self-reports.
+
+        Only runs on records with psycheduse_life_nomic > 0 (claimed SP use in their
+        lifetime) and skips records where sp_type_recent or sp_dayslastuse is blank
+        (added to 'nanresponses' and excluded from further checks).
+
+        Verification flow:
+          If verify_emailed=1 (we already sent the clarification survey):
+            - sp_verify_pass > 0 → previously verified; skip (count as pass)
+            - sp_verify_pass < 1 → gave inconsistent answers twice → failed_sp_qc
+          Otherwise, runs consistency checks:
+
+        Checks leading to 'failed_sp_qc' (critical failure):
+          - psycheduse_life_nomic < 1 AND psychedelicuse_lifetimetot < 1
+            (claimed SP use in screening but reports zero in main survey)
+          - sp_fraud_aes___1–5: endorsed non-SP side effects as SP effects
+          - sp_fraud_psi/lsd/mesc/dmt/5meo: reported an implausible route of
+            administration (e.g. inhalation of psilocybin)
+
+        Checks leading to 'failed_usetime_qc' (verification needed, not auto-fail):
+          - sp_dayslastuse < 180 but psycheduse_6month_nomic < 1 (or vice versa)
+          - sp_dayslastuse < 365 but psycheduse_year_nomic < 1 (or vice versa)
+
+        Checks leading to 'illogical_year' / 'illogical_life' (verification needed):
+          - Year count > lifetime count, or year count > lifetime count
+
+        Checks leading to 'wrong_recent' (verification needed):
+          - sp_type_recent (screening) != sp_type_recent_qc (baseline survey)
+
+        Returns a dict with keys for each finding list plus 'absurdity_reasons'
+        ({record_id: reason_string}).
+        """
         findings = {
             "failed_sp_qc": [],
             "failed_usetime_qc": [],
@@ -1085,7 +1584,6 @@ class RelaunchQuickQC:
             "illogical_life": [],
             "wrong_recent": [],
             "nanresponses": [],
-            "nanresponses_screen": [],
             "absurdity_reasons": {},
         }
 
@@ -1101,10 +1599,9 @@ class RelaunchQuickQC:
             | df_finished["sp_dayslastuse"].isna()
         )
         findings["nanresponses"] = to_int_list(df_finished.loc[nan_mask, "record_id"].tolist())
-        findings["nanresponses_screen"] = to_int_list(df_finished.loc[df_finished["sp_lastuse_days_screen"].isna(), "record_id"].tolist())
 
         df_finished = df_finished.loc[
-            ~df_finished["record_id"].isin(findings["nanresponses"] + findings["nanresponses_screen"])
+            ~df_finished["record_id"].isin(findings["nanresponses"])
         ].copy()
 
         for _, row in df_finished.iterrows():
@@ -1191,6 +1688,17 @@ class RelaunchQuickQC:
         task_name: str,
         fraud_list: list[int],
     ) -> tuple[bool, bool]:
+        """Validate a manually-retrieved (backup) task JSON string before parsing it.
+
+        Returns (should_process, should_skip):
+          (True, False)  — compressed payload detected; caller should decompress + parse
+          (False, True)  — researcher said the string looks valid but unusual; skip for now
+          (False, False) — invalid / fraudulent string; record added to fraud_list
+
+        A compressed payload starts with 'H4sIAAAAA' (gzip+base64 prefix).
+        Strings < 50 chars or obviously fake ('testing', '123') are auto-flagged.
+        Anything else prompts the researcher to decide interactively.
+        """
         if json_string.startswith("H4sIAAAAA"):
             return True, False
 
@@ -1212,6 +1720,16 @@ class RelaunchQuickQC:
             print("Please enter 'yes' or 'no'.")
 
     def _load_ach_trials(self, df_raw: pd.DataFrame, fraud_list: list[int]) -> pd.DataFrame:
+        """Parse all ACH task payloads into a trial-level DataFrame.
+
+        For each record, tries task_data_ach_task_short_baseline (compressed primary)
+        then task_data_ach_bl_retrieved (manually-retrieved JSON backup).
+        Parses the 4-block component structure via _ch_components_to_dataframe().
+        After parsing, detects copy-paste fraud by pivoting on reaction time and
+        flagging any two records with identical RT sequences.
+        Returns a DataFrame with columns: response, rt, decibels, component,
+        record_id, intensity, trial.
+        """
         participant_dfs: list[pd.DataFrame] = []
         for _, row in df_raw.iterrows():
             record_id = int(row["record_id"])
@@ -1251,6 +1769,13 @@ class RelaunchQuickQC:
         return ach_master
 
     def _load_vch_trials(self, df_raw: pd.DataFrame, fraud_list: list[int]) -> pd.DataFrame:
+        """Parse all VCH task payloads into a trial-level DataFrame.
+
+        Identical in structure to _load_ach_trials but uses task_data_vch_short_psychedelic_bl
+        / task_data_vch_bl_retrieved and the 'contrasts' intensity dimension.
+        Returns a DataFrame with columns: response, rt, contrasts, component,
+        record_id, intensity, trial.
+        """
         participant_dfs: list[pd.DataFrame] = []
         for _, row in df_raw.iterrows():
             record_id = int(row["record_id"])
@@ -1290,6 +1815,13 @@ class RelaunchQuickQC:
         return vch_master
 
     def _ch_components_to_dataframe(self, data: dict[str, Any], record_id: int, level_field: str) -> pd.DataFrame:
+        """Convert one participant's decoded ACH or VCH payload dict into a trial DataFrame.
+
+        The payload is a dict with keys 'component_1' through 'component_4', each
+        containing 'response', 'responseTime', and a level field ('decibels' or
+        'contrasts').  Concatenates all 4 blocks into a single DataFrame and computes
+        an 'intensity' column (25/50/75 percentile bins based on unique level values).
+        """
         blocks = ["component_1", "component_2", "component_3", "component_4"]
         block_dfs: list[pd.DataFrame] = []
         for block_number, block in enumerate(blocks, start=1):
@@ -1316,6 +1848,18 @@ class RelaunchQuickQC:
         return participant_df
 
     def _evaluate_ch_task(self, task_df: pd.DataFrame, intensity_field: str, prefix: str) -> dict[str, list[int]]:
+        """Compute QC pass/fail lists for an ACH or VCH dataset.
+
+        Runs a logistic regression of detection (response) ~ intensity for each
+        participant.  A valid change-detection task should produce a positive slope
+        (more intense stimulus → more detections).
+
+        Returns a dict with three keys (prefix appended to each, e.g. '_vch'):
+          'negative{prefix}' : β < 0 (worse detection at higher intensities — fraud)
+          'zero{prefix}'     : p > 0.05 (slope not significantly different from zero)
+          'fail_first_fifteen{prefix}': < 50% detection rate in first 15 trials
+                                        (likely not wearing headphones / not watching)
+        """
         if task_df.empty:
             suffix = prefix or ""
             return {
@@ -1336,6 +1880,12 @@ class RelaunchQuickQC:
         }
 
     def _test_detection_probability(self, detections: pd.DataFrame, intensity_field: str) -> pd.DataFrame:
+        """Fit a logistic regression (response ~ intensity) per participant.
+
+        Returns a DataFrame with columns [record_id, p_value, beta_coefficient].
+        Records where the model fails to converge receive p_value=1.0 / beta=0.0
+        (treated as zero slope — non-significant but not penalised as negative).
+        """
         results: list[dict[str, Any]] = []
         for record_id, group in detections.groupby("record_id"):
             try:
@@ -1353,6 +1903,15 @@ class RelaunchQuickQC:
         return pd.DataFrame(results)
 
     def _load_prl_trials(self, df_raw: pd.DataFrame, fraud_list: list[int]) -> pd.DataFrame:
+        """Parse all PRL task payloads into a trial-level DataFrame.
+
+        PRL payloads are compressed JSON dicts with a 'data' list (each element is one
+        trial row) plus 'recordId' and 'projectId'.  Also handles the older list-of-dicts
+        format from early data collection.
+        Detects copy-paste fraud via duplicate decision-time sequences across participants.
+        Returns a DataFrame with columns: record_id, trial, decisionTime,
+        rewardProbChoice, keyChoice, outcome (plus any additional fields in the payload).
+        """
         frames: list[pd.DataFrame] = []
         for _, row in df_raw.iterrows():
             record_id = int(row["record_id"])
@@ -1407,6 +1966,11 @@ class RelaunchQuickQC:
         return df_prl
 
     def _process_prl_json(self, compressed_string: str) -> list[dict[str, Any]]:
+        """Decompress a PRL payload and return the flat list of trial dicts.
+
+        Attaches 'record_id' and 'projectId' from the outer payload dict to each
+        trial row so they are preserved through the concat step.
+        """
         data = decode_compressed_json(compressed_string)
         rows = data.get("data", [])
         record_id = data.get("recordId")
@@ -1417,6 +1981,18 @@ class RelaunchQuickQC:
         return rows
 
     def _evaluate_prl(self, df_prl: pd.DataFrame) -> dict[str, list[int]]:
+        """Compute QC pass/fail lists for the PRL (Probabilistic Reward Learning) task.
+
+        Returns a dict with three keys:
+          'worse_than_chance' : < 34% correct responses (rewardProbChoice == 0.85)
+                                (random guessing yields ~50% correct, so this is well
+                                 below chance and indicates non-engagement or reversal)
+          'non_responders'    : > 10% no-response trials (keyChoice == -999)
+          'no_lose_stay'      : < 1% lose-stay behaviour
+                                (a real learner should almost never stay after a loss;
+                                 near-zero lose-stay means they never switched, i.e.
+                                 ignored feedback entirely)
+        """
         if df_prl.empty:
             return {"worse_than_chance": [], "non_responders": [], "no_lose_stay": []}
 
@@ -1468,12 +2044,23 @@ class RelaunchQuickQC:
         }
 
     def _append_percent(self, dataframe: pd.DataFrame, column: str, value: Any, new_column: str) -> pd.DataFrame:
+        """Compute the per-participant percentage of rows where `column` equals `value`.
+
+        Merges the result back onto the input DataFrame as a new column `new_column`.
+        Used to compute %Correct, %NoResponse, and lose_stay_percent for PRL QC.
+        """
         matching = dataframe.loc[dataframe[column] == value].groupby("record_id").size()
         total = dataframe.groupby("record_id").size()
         percent = (matching / total) * 100
         return dataframe.merge(percent.reset_index(name=new_column), on="record_id", how="left")
 
     def _load_spacejunk_trials(self, df_raw: pd.DataFrame, fraud_list: list[int]) -> pd.DataFrame:
+        """Parse SpaceJunk game payloads and flag copy-paste duplicates.
+
+        SpaceJunk is a secondary task whose data is collected for offline analysis but
+        does not currently trigger any QC failures.  This method loads the data and
+        adds any duplicate-reaction-time records to fraud_list for the copy-paste check.
+        """
         frames: list[pd.DataFrame] = []
         for _, row in df_raw.iterrows():
             record_id = int(row["record_id"])
@@ -1529,6 +2116,13 @@ class RelaunchQuickQC:
     # ------------------------------------------------------------------
 
     def _completion_update_fields(self) -> list[str]:
+        """Return the list of REDCap field names that the completion QC may write.
+
+        The update DataFrame is built from self.df_og filtered to only these columns.
+        Fields that don't exist in the export are silently dropped, so this list can
+        include fields that are present in some project versions but not others.
+        Includes all replay, reset, and payment fields for all three tasks.
+        """
         fields = [
             "record_id",
             "qc_passed",
@@ -1612,10 +2206,17 @@ class RelaunchQuickQC:
         qc_lists: dict[str, list[int]],
         absurdity_reasons: dict[int, str],
     ) -> str | None:
+        """Return a failure reason string if this record should be hard-failed at baseline.
+
+        Checks qc_lists for the critical failure categories (attention checks, race/age
+        mismatch, trap questions, copy-paste fraud, and confirmed absurd SP responses).
+        Returns the first matching reason string, or None if no critical failure found.
+        The returned string is written to qc_notes and qc_passed is set to 0.
+        """
         note_map = {
             "failedAttnCheck": "Failed attention check",
             "failed_new_qc": "Failed race/age consistency QC",
-            "failed_trap_questions": "Failed trap/fraud-detection questions (fake drug or dose mismatch or missed attention check)",
+            "failed_trap_questions": "Failed trap/fraud-detection questions (fake drug, dose mismatch, AI copy-paste, or missed attention check)",
             "fraud_copy_paste_ach": "Copy pasted ACH data",
             "fraud_copy_paste_vch": "Copy pasted VCH data",
             "fraud_copy_paste_prl": "Copy pasted PRL data",
@@ -1634,13 +2235,21 @@ class RelaunchQuickQC:
         qc_lists: dict[str, list[int]],
         absurdity_reasons: dict[int, str],
     ) -> str | None:
+        """Return a verification reason if this record needs the SP clarification survey.
+
+        Checks for SP response patterns that are suspicious but could reflect genuine
+        reporting errors rather than fraud: illogical timeline counts, wrong most-recent
+        substance, or blank fields.  If triggered, verify_emailed=1 is set and the
+        participant receives a clarification survey.  The record is skipped from future
+        QC runs until sp_verify_pass is set by the researcher.
+        Returns the first matching reason string, or None if verification is not needed.
+        """
         verification_keys = [
             "failed_usetime_qc",
             "illogical_life",
             "illogical_year",
             "wrong_recent",
             "nanresponses",
-            "nanresponses_screen",
         ]
         for key in verification_keys:
             if record_id in qc_lists.get(key, []):
@@ -1648,6 +2257,12 @@ class RelaunchQuickQC:
         return None
 
     def _task_failures_for_record(self, record_id: int, qc_lists: dict[str, list[int]]) -> list[tuple[str, str]]:
+        """Return a list of (task_name, fail_reason) for each task this record failed.
+
+        Iterates over TASK_CONFIGS and checks each task's failure_conditions against
+        qc_lists.  At most one failure reason is returned per task (the first match).
+        Returns an empty list if the record passed all tasks.
+        """
         failures: list[tuple[str, str]] = []
         for task_name, config in TASK_CONFIGS.items():
             for condition in config.failure_conditions:
@@ -1657,6 +2272,12 @@ class RelaunchQuickQC:
         return failures
 
     def _replay_attempt_number(self, row: pd.Series, replay_fields: list[str]) -> int:
+        """Return the attempt number (1-based) for the next replay of a failed task.
+
+        Counts how many replay_fields are already filled (non-NaN) to determine which
+        replay slot is next.  Used for the failed-task JSON log so we can track which
+        attempt a given payload belongs to.
+        """
         count = 1
         for field in replay_fields:
             if field in row.index and pd.notna(row[field]):
@@ -1664,6 +2285,14 @@ class RelaunchQuickQC:
         return count
 
     def _queue_task_retry(self, update_df: pd.DataFrame, record_id: int, config: TaskConfig) -> None:
+        """Set up the next replay attempt for a failed task in the update DataFrame.
+
+        Finds the first unfilled replay slot (e.g. ach_replay_2 if ach_replay already=1)
+        and sets both the replay flag and the matching replay_links field to 1.
+        Then clears the task payload field and all reset_cols (headphone check, browser
+        field, nosave fields, etc.) so the participant re-does the pre-task checklist.
+        If all 4 slots are exhausted, sets fourth_fail=1 instead of a replay link.
+        """
         row = update_df.loc[update_df["record_id"] == record_id].reset_index(drop=True)
         if row.empty:
             return
@@ -1694,6 +2323,11 @@ class RelaunchQuickQC:
                 update_df.loc[update_df["record_id"] == record_id, field] = np.nan
 
     def _task_payload_for_export(self, row: pd.Series, config: TaskConfig) -> str:
+        """Return the raw task payload string for a record (primary or backup field).
+
+        Used when logging a failed task to FAILED_JSON_PATH so the raw data is
+        preserved before the task field is cleared for replay.
+        """
         primary = row.get(config.task_col, np.nan)
         if isinstance(primary, str):
             return primary
@@ -1703,11 +2337,20 @@ class RelaunchQuickQC:
         return ""
 
     def _apply_record_updates(self, update_df: pd.DataFrame, record_id: int, updates: dict[str, Any]) -> None:
+        """Write a dict of {field: value} updates into the update DataFrame for one record.
+
+        Silently skips fields that don't exist as columns in the DataFrame.
+        """
         for field, value in updates.items():
             if field in update_df.columns:
                 update_df.loc[update_df["record_id"] == record_id, field] = value
 
     def _append_failed_json_rows(self, rows: list[dict[str, Any]]) -> int:
+        """Append failed-task records to the shared-drive CSV log and return the count.
+
+        Creates the CSV if it doesn't exist.  Each row contains record_id, task name,
+        fail reason, attempt number, and the raw JSON payload string for offline analysis.
+        """
         if not rows:
             return 0
 
@@ -1721,6 +2364,14 @@ class RelaunchQuickQC:
         return len(rows)
 
     def _build_baseline_expensesheet(self, update_df: pd.DataFrame) -> Path | None:
+        """Generate a CSV expense sheet for all baseline records that passed QC.
+
+        Reads qc_passed from the update DataFrame and pulls participant details from
+        self.df.  Each passing record becomes one row in the expense sheet with the
+        date of participation (latest instrument completion date), payment amount ($50),
+        payment type (Amazon gift card), and delivery email (email_rpt).
+        Saves to today's date directory.  Returns the path, or None if no payments.
+        """
         assert self.df is not None
         payment_rows: list[pd.DataFrame] = []
 
@@ -1774,6 +2425,11 @@ class RelaunchQuickQC:
         expensesheet_path: Path | None,
         failed_json_count: int,
     ) -> None:
+        """Write a markdown summary of the baseline completion QC to today's date directory.
+
+        Saved as completion_qc_summary.md.  Lists record counts and all non-empty QC
+        lists (zero, negative, failed_sp_qc, etc.) for a quick post-run audit.
+        """
         summary_path = self.date_directory / "completion_qc_summary.md"
         lines = [
             "# Completion QC Summary",
@@ -1798,6 +2454,12 @@ class RelaunchQuickQC:
     # ------------------------------------------------------------------
 
     def _manual_tasks_needed(self, update_df: pd.DataFrame) -> bool:
+        """Return True if any record in the update DataFrame has a manual follow-up action.
+
+        Manual actions include: replay invitation links set, fraudulent flags set, or
+        fourth_fail set.  Determines whether to create a TASKS_FULLRECORDS_INCOMPLETE
+        flag that must be manually resolved before the next QC run.
+        """
         manual_fields = [
             "fraudulent_email_inconsistentanswers",
             "fraudulent_email",
@@ -1822,6 +2484,20 @@ class RelaunchQuickQC:
         return False
 
     def _generate_flag_files(self, expensesheet_needed: bool, manual_tasks_needed: bool) -> None:
+        """Write the initial set of flag files for today's QC run to the date directory.
+
+        Flag files are plain text files whose names encode the state of each workflow
+        step.  Another researcher (or a future QC run) checks these to know what is
+        still outstanding.  Naming convention: <STEP>_INCOMPLETE.txt (needs action) or
+        <STEP>_NA.txt (not applicable today).  Completed steps become <STEP>_COMPLETE.txt
+        via _update_redcap_flag().
+
+        Flags written:
+          REDCAP_SCREENS_INCOMPLETE — screening imports need to be pushed to REDCap
+          REDCAP_FULLRECORDS_INCOMPLETE — baseline imports need to be pushed to REDCap
+          TASKS_FULLRECORDS_INCOMPLETE — replay emails / fraud follow-ups still pending
+          PAYMENTS_FULLRECORDS_INCOMPLETE — expense sheet not yet uploaded to SharePoint
+        """
         ensure_directory(self.date_directory)
 
         if self.records_to_screen:
@@ -1845,6 +2521,11 @@ class RelaunchQuickQC:
             (self.date_directory / "PAYMENTS_FULLRECORDS_NA.txt").write_text(self.user_name)
 
     def _update_redcap_flag(self, flag_name: str) -> None:
+        """Rename an INCOMPLETE flag file to COMPLETE after its step is done.
+
+        Called after import_screening_updates() and import_completion_updates() to
+        signal that the REDCap push succeeded.  No-ops if the flag file doesn't exist.
+        """
         incomplete_path = self.date_directory / f"{flag_name}.txt"
         if not incomplete_path.exists():
             return
@@ -1884,6 +2565,12 @@ class RelaunchQuickQC:
 
 
 def nonempty_task_series(df: pd.DataFrame, primary_field: str, backup_field: str | None = None) -> pd.Series:
+    """Return a boolean Series indicating which rows have a non-empty task payload.
+
+    Vectorised version of nonempty_task_value() for use in DataFrame masks.
+    Used by _identify_completed_baseline_records() to check whether ACH/VCH/PRL
+    data has been submitted before adding a record to the baseline review queue.
+    """
     primary = df[primary_field].apply(lambda value: isinstance(value, str) and value.strip()) if primary_field in df.columns else pd.Series(False, index=df.index)
     if backup_field and backup_field in df.columns:
         backup = df[backup_field].apply(lambda value: isinstance(value, str) and value.strip())
