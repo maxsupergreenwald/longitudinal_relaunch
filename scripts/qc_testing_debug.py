@@ -53,7 +53,9 @@ MOCK_DRIVE_ROOT = SCRIPT_DIR / "qc_test_drive"
 MOCK_IP_PATH = MOCK_DRIVE_ROOT / "ips" / "ips_full.csv"
 MOCK_JSON_PATH = MOCK_DRIVE_ROOT / "jsons" / "failed_task_jsons_baseline.csv"
 MOCK_QC_TODO_PATH = MOCK_DRIVE_ROOT / "qc_to_dos"
-SNAPSHOT_PATH = SCRIPT_DIR / "qc_test_snapshot.json"
+SNAPSHOT_PATH           = SCRIPT_DIR / "qc_test_snapshot.json"
+SCREENING_SNAPSHOT_PATH = SCRIPT_DIR / "qc_test_snapshot_screening.json"
+BASELINE_SNAPSHOT_PATH  = SCRIPT_DIR / "qc_test_snapshot_baseline.json"
 TASK_PAYLOADS_PATH = SCRIPT_DIR / "qc_task_payloads.json"
 FAILED_TASK_EXAMPLES_PATH = SCRIPT_DIR.parent / "resources" / "failed_task_examples.csv"
 
@@ -272,21 +274,33 @@ def cmd_setup() -> None:
 # SECTION 5: Snapshot Management
 # ============================================================================
 
-def cmd_snapshot() -> None:
+def _snapshot_path(stage: str | None) -> Path:
+    return {
+        "screening": SCREENING_SNAPSHOT_PATH,
+        "baseline":  BASELINE_SNAPSHOT_PATH,
+    }.get(stage or "", SNAPSHOT_PATH)
+
+
+def cmd_snapshot(stage: str | None = None) -> None:
+    path = _snapshot_path(stage)
     print(f"Exporting record {TEST_RECORD_ID} from REDCap...")
     record = redcap_export_record(TEST_RECORD_ID)
-    with open(SNAPSHOT_PATH, "w") as f:
+    with open(path, "w") as f:
         json.dump(record, f, indent=2)
-    print(f"Snapshot saved to {SNAPSHOT_PATH} ({len(record)} fields).")
+    label = f" ({stage})" if stage else ""
+    print(f"Snapshot{label} saved to {path} ({len(record)} fields).")
 
 
-def cmd_restore() -> None:
-    if not SNAPSHOT_PATH.exists():
-        print(f"ERROR: Snapshot not found at {SNAPSHOT_PATH}")
-        print("Run: python3 qc_testing_debug.py snapshot")
+def cmd_restore(stage: str | None = None) -> None:
+    path = _snapshot_path(stage)
+    if not path.exists():
+        label = f" ({stage})" if stage else ""
+        hint = f"snapshot {stage}" if stage else "snapshot"
+        print(f"ERROR: Snapshot{label} not found at {path}")
+        print(f"Run: python3 qc_testing_debug.py {hint}")
         sys.exit(1)
 
-    with open(SNAPSHOT_PATH) as f:
+    with open(path) as f:
         snapshot = json.load(f)
 
     print(f"Restoring record {TEST_RECORD_ID} from snapshot ({len(snapshot)} fields)...")
@@ -492,6 +506,53 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     expected_fields_dupe={}, notes="",
 ),
 
+"SCR-11b": ScenarioSpec(
+    "SCR-11b", "Recent SP use, willing to wait (clean)", "screening",
+    "sp_dayslastuse=30 AND psychedelic_abstinence_yn=1 AND clean IP/phone -> sp_wait path -> "
+    "screening_pass=1, eligible_afterwait_notify=1 (NOT eligible_notify).",
+    field_overrides={"sp_dayslastuse": "30", "psychedelic_abstinence_yn": "1"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Phone verdict: n (clear)", "Import: yes"],
+    expected_fields={"screening_pass": "1", "eligible_afterwait_notify": "1", "eligible_notify": None},
+    expected_fields_dupe={},
+    notes="eligible_notify must remain blank. eligible_afterwait_notify=1 sends the deferred invitation.",
+),
+
+"SCR-11c": ScenarioSpec(
+    "SCR-11c", "Recent SP use, willing to wait, fraudulent phone", "screening",
+    "sp_dayslastuse=30, psychedelic_abstinence_yn=1 (willing to wait), but user enters 'y' at "
+    "phone verdict -> normal fraud path. sp_wait does NOT protect against explicit phone fraud.",
+    field_overrides={"sp_dayslastuse": "30", "psychedelic_abstinence_yn": "1"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Phone verdict: y (fraudulent/VOIP)", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "eligible_afterwait_notify": None,
+    },
+    expected_fields_dupe={},
+    notes="eligible_afterwait_notify must remain blank — phone fraud overrides the wait path.",
+),
+
+"SCR-11d": ScenarioSpec(
+    "SCR-11d", "Recent atypical use, willing to wait (clean)", "screening",
+    "SP dayslastuse is fine (>42) but mdma_dayslastuse=10 triggers atypical_recentuse calc -> "
+    "sp_wait path. psychedelic_abstinence_yn=1 -> screening_pass=1, eligible_afterwait_notify=1.",
+    field_overrides={"mdma_lifetime": "1", "mdma_dayslastuse": "10", "psychedelic_abstinence_yn": "1"},
+    ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Phone verdict: n (clear)", "Import: yes"],
+    expected_fields={"screening_pass": "1", "eligible_afterwait_notify": "1", "eligible_notify": None},
+    expected_fields_dupe={},
+    notes=(
+        "atypical_recentuse is a REDCap calc field that fires when atypical substance use is "
+        "recent. If the calc doesn't update from just setting mdma_dayslastuse, set "
+        "atypical_recentuse=1 directly in field_overrides as a fallback."
+    ),
+),
+
 "SCR-12": ScenarioSpec(
     "SCR-12", "Duplicate email", "screening",
     "email_rpt on record 1 matches a prior record's email (record 9998). "
@@ -588,6 +649,110 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     expected_fields={"max_number_followup": "1"},
     expected_fields_dupe={},
     notes="screening_pass and qc_passed should remain blank.",
+),
+
+"SCR-19": ScenarioSpec(
+    "SCR-19", "Fake drug endorsed at screening (kaopectamine)", "screening",
+    "kaopectamine_lifetime=1 triggers 'Endorsed fake drug (kaopectamine) during screening' hard fail "
+    "in _apply_screening_eligibility_rules. Distinct from BL-03 (same trap caught at baseline QC).",
+    field_overrides={"kaopectamine_lifetime": "1"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:kaopectamine",
+    },
+    expected_fields_dupe={},
+    notes="Hard fail before phone verdict — no phone verdict prompt.",
+),
+
+"SCR-20": ScenarioSpec(
+    "SCR-20", "AI prompt injection field filled (flexibility_yn)", "screening",
+    "flexibility_yn='ok' — the @HIDDEN-SURVEY honeypot field was filled in. "
+    "Normal participants never see it; AI agents parsing raw HTML may follow the embedded instruction.",
+    field_overrides={"flexibility_yn": "ok"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:flexibility_yn",
+    },
+    expected_fields_dupe={},
+    notes="Hard fail before phone verdict — no phone verdict prompt.",
+),
+
+"SCR-21": ScenarioSpec(
+    "SCR-21", "Screening completed too quickly (screen_seconds_taken < 90)", "screening",
+    "screen_seconds_taken=45 triggers 'Completed screening suspiciously fast' hard fail.",
+    field_overrides={"screen_seconds_taken": "45"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:screen_seconds_taken",
+    },
+    expected_fields_dupe={},
+    notes="Hard fail before phone verdict — no phone verdict prompt.",
+),
+
+"SCR-22": ScenarioSpec(
+    "SCR-22", "screen_motive exactly 500 characters (length heuristic only)", "screening",
+    "screen_motive is exactly 500 characters but does NOT begin with the AI template phrase. "
+    "Fires heuristic 1 only: 'response is exactly 500 characters'.",
+    field_overrides={"screen_motive": "a" * 500}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:exactly 500 characters",
+    },
+    expected_fields_dupe={},
+    notes="Hard fail before phone verdict. Confirm qc_notes does NOT mention 'AI template phrase'.",
+),
+
+"SCR-23": ScenarioSpec(
+    "SCR-23", "screen_motive AI template phrase — 490 chars (phrase heuristic only)", "screening",
+    "screen_motive starts with 'I would describe my personal motivation' and is 490 chars (in "
+    "476–524 range) but NOT exactly 500. Fires heuristic 2 only: 'begins with AI template phrase'.",
+    field_overrides={"screen_motive": "I would describe my personal motivation" + "x" * 452},
+    ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:AI template phrase",
+    },
+    expected_fields_dupe={},
+    notes=(
+        "Hard fail before phone verdict. screen_motive value is 490 chars (38 + 452). "
+        "Confirm qc_notes does NOT mention 'exactly 500 characters'."
+    ),
+),
+
+"SCR-24": ScenarioSpec(
+    "SCR-24", "screen_motive both AI flags (500 chars + template phrase)", "screening",
+    "screen_motive starts with 'I would describe my personal motivation' AND is exactly 500 chars. "
+    "Both heuristics fire; both reasons are semicolon-joined in qc_notes.",
+    field_overrides={"screen_motive": "I would describe my personal motivation" + "x" * 462},
+    ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:AI template phrase",
+    },
+    expected_fields_dupe={},
+    notes=(
+        "Hard fail before phone verdict. screen_motive value is exactly 500 chars (38 + 462). "
+        "qc_notes should contain both 'exactly 500 characters' AND 'AI template phrase' "
+        "semicolon-joined."
+    ),
 ),
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1276,10 @@ def _check_fields(record: dict, expected: dict, record_id: int) -> bool:
         elif expected_value == "NOT_EMPTY":
             passed = actual is not None and str(actual).strip() != ""
             exp_str = "(not empty)"
+        elif isinstance(expected_value, str) and expected_value.startswith("CONTAINS:"):
+            needle = expected_value[len("CONTAINS:"):]
+            passed = needle.lower() in str(actual or "").lower()
+            exp_str = f"(contains '{needle}')"
         else:
             try:
                 passed = float(str(actual).strip()) == float(str(expected_value).strip())
@@ -1217,8 +1386,12 @@ For task failure scenarios (BL-17,19,21,22,25):
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("setup")
-    sub.add_parser("snapshot")
-    sub.add_parser("restore")
+    snap_p = sub.add_parser("snapshot")
+    snap_p.add_argument("stage", nargs="?", choices=["screening", "baseline"], default=None,
+                        help="Stage to snapshot: 'screening' or 'baseline' (omit for legacy single slot)")
+    rest_p = sub.add_parser("restore")
+    rest_p.add_argument("stage", nargs="?", choices=["screening", "baseline"], default=None,
+                        help="Stage to restore: 'screening' or 'baseline' (omit for legacy single slot)")
     sub.add_parser("list")
     sub.add_parser("load-payloads")
     show_p = sub.add_parser("show")
@@ -1231,13 +1404,15 @@ For task failure scenarios (BL-17,19,21,22,25):
     args = parser.parse_args()
     dispatch = {
         "setup": cmd_setup,
-        "snapshot": cmd_snapshot,
-        "restore": cmd_restore,
         "list": cmd_list,
         "load-payloads": cmd_load_payloads,
     }
     if args.command in dispatch:
         dispatch[args.command]()
+    elif args.command == "snapshot":
+        cmd_snapshot(getattr(args, "stage", None))
+    elif args.command == "restore":
+        cmd_restore(getattr(args, "stage", None))
     elif args.command == "show":
         cmd_show(args.scenario_id)
     elif args.command == "apply":

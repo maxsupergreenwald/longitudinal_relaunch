@@ -51,11 +51,17 @@ This creates `scripts/qc_test_drive/` with the required directory structure and 
 export AIM8_SHAREDDRIVE_PATH=/path/to/scripts/qc_test_drive
 ```
 
-**Step 3 — Save the clean snapshot** (run after record_id=1 is fully set up with passing data):
+**Step 3a — Save the screening snapshot** (run once record_id=1 has a submitted screening survey, `screening_pass` and `qc_passed` null, `phone_number` present — no task data needed yet):
 ```bash
-python3 qc_testing_debug.py snapshot
+python3 qc_testing_debug.py snapshot screening
 ```
-This saves all fields from record_id=1 to `qc_test_snapshot.json`. Every `restore` call reimports this snapshot.
+Saves to `qc_test_snapshot_screening.json`. Use `restore screening` between every SCR-XX test.
+
+**Step 3b — Save the baseline snapshot** (run _after_ Stage 1 is complete and you have upgraded record_id=1: all task data present, `screening_pass=1`, `qc_passed` null):
+```bash
+python3 qc_testing_debug.py snapshot baseline
+```
+Saves to `qc_test_snapshot_baseline.json`. Use `restore baseline` between every BL-XX test.
 
 **Step 4 — Load task failure payloads** (required before BL-17, BL-19, BL-21, BL-22, BL-25):
 ```bash
@@ -66,6 +72,9 @@ Four payloads are auto-loaded from `resources/failed_task_examples.csv` (`ach_ze
 ---
 
 ## Standard Test Cycle
+
+### Stage 1 — Screening scenarios (SCR-XX)
+Use `restore screening` after every run. Record_id=1 must be in the screening-ready state (screening snapshot taken via Step 3a above).
 
 ```bash
 # 1. Apply the scenario (sets REDCap fields, updates ips_full.csv)
@@ -78,14 +87,32 @@ python3 quickQC_api_calling_v7_relaunch.py
 # 3. Verify results
 python3 qc_testing_debug.py verify SCR-XX
 
-# 4. Restore before next scenario
-python3 qc_testing_debug.py restore
+# 4. Restore the screening snapshot before the next scenario
+python3 qc_testing_debug.py restore screening
+```
+
+### Stage 2 — Baseline scenarios (BL-XX)
+Once all SCR scenarios pass: complete record_id=1 (add task data, confirm `screening_pass=1`, null `qc_passed`), take the baseline snapshot (Step 3b above), then use `restore baseline` after every run.
+
+```bash
+# 1. Apply the scenario
+python3 qc_testing_debug.py apply BL-XX
+
+# 2. Run the QC script
+export AIM8_SHAREDDRIVE_PATH=./qc_test_drive
+python3 quickQC_api_calling_v7_relaunch.py
+
+# 3. Verify results
+python3 qc_testing_debug.py verify BL-XX
+
+# 4. Restore the baseline snapshot before the next scenario
+python3 qc_testing_debug.py restore baseline
 ```
 
 **Useful commands:**
 ```bash
 python3 qc_testing_debug.py list              # show all scenario IDs and expected outcomes
-python3 qc_testing_debug.py show BL-17        # print scenario details without applying
+python3 qc_testing_debug.py show SCR-20       # print scenario details without applying
 ```
 
 ---
@@ -97,7 +124,7 @@ python3 qc_testing_debug.py show BL-17        # print scenario details without a
 - **SCR-15 sets `ip_zoom_invite=1`.** This field is written to REDCap and will appear in the restored snapshot's fields. The snapshot already contains the pre-test value, so `restore` handles it.
 - **BL-16a/b/c and SCR-12/SCR-15 use record_id=9998.** The `restore` command clears all test fields on record 9998 after each run.
 - **Task retry scenarios (BL-17 through BL-26) do NOT set `qc_passed=0`.** At baseline, task slope failures route to `_queue_task_retry()`. Only questionnaire/fraud checks cause `qc_passed=0`. See scenario notes.
-- **The snapshot must be retaken** if you make permanent changes to record_id=1's clean baseline data (e.g., adding new task data, changing demographics).
+- **Snapshots must be retaken** if you permanently change record_id=1's data. Retake `snapshot screening` if you change demographics or screening fields; retake `snapshot baseline` if you update task data or questionnaire values.
 
 ---
 
@@ -836,6 +863,22 @@ Sets `screen_motive` to `"I would describe my personal motivation" + "x" * 462` 
 **Reset:** `python3 qc_testing_debug.py restore`
 
 **Notes:** This is the combined case — both semicolon-joined reasons should appear in a single `qc_notes` string. Confirm the output reads like: `"screen_motive: response is exactly 500 characters; screen_motive: response is 500 chars and begins with AI template phrase"`.
+
+---
+
+## Graduating from Stage 1 to Stage 2
+
+Once all SCR-XX scenarios pass, upgrade record_id=1 from screening-ready to baseline-ready:
+
+1. **Run SCR-00** (or manually set `screening_pass=1`, `eligible_notify=1`) so the record is in an approved state.
+2. **Add task data** to the three task fields (`task_data_ach_task_short_baseline`, `task_data_vch_short_psychedelic_bl`, `task_data_prltask`) — paste valid passing JSON into each field via the REDCap UI or API.
+3. **Fill in all questionnaire fields** with plausible passing values (attention checks = 1, `race_qc` = copy of `race_v2`, etc.).
+4. **Null out `qc_passed`** so the record sits in the baseline completion queue.
+5. **Take the baseline snapshot:**
+   ```bash
+   python3 qc_testing_debug.py snapshot baseline
+   ```
+6. Confirm by running BL-00 (should produce `qc_passed=1`) before proceeding to failure scenarios.
 
 ---
 
