@@ -25,7 +25,7 @@ This script handles two distinct review queues that arise during daily data coll
      - Runs task-level QC on ACH, VCH, and PRL data (slope, zero-detection,
        first-15-trial, copy-paste duplicate checks)
      - Checks attention checks, race/age consistency, and trap/fraud questions
-       (kaopectamine, fraud_caps, fraud_pdi, fraud_recent_dose)
+       (kaopectamine, fraud_caps, fraud_pdi)
      - Evaluates SP use responses for internal consistency (illogical counts,
        wrong most-recent type, implausible routes of administration)
      - Routes failed-task records into replay slots (up to 4 per task) rather than
@@ -1713,7 +1713,6 @@ class RelaunchQuickQC:
 
         Checks (all lead to critical failure — qc_passed=0):
         - kaopectamine_lifetime == '1'  (fake drug endorsed — radio field, Yes=1)
-        - fraud_recent_dose == '1'           (dose self-report doesn't match computed most-recent dose)
         - fraud_caps == '0'                  (missed embedded CAPS attention check — correct answer is Yes/1)
         - fraud_pdi == '0'                   (missed embedded PDI attention check — correct answer is Yes/1)
         - ai_copy_paste == '1' or '3'        (disagreed with no-copy-paste policy, or self-declared as AI)
@@ -1725,11 +1724,6 @@ class RelaunchQuickQC:
         kao_field = "kaopectamine_lifetime"
         if kao_field in df_raw.columns:
             mask = pd.to_numeric(df_raw[kao_field], errors="coerce") == 1
-            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
-
-        # fraud_recent_dose: calc returns 1 when dose report mismatches
-        if "fraud_recent_dose" in df_raw.columns:
-            mask = pd.to_numeric(df_raw["fraud_recent_dose"], errors="coerce") == 1
             failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
 
         # fraud_caps: yesno — correct answer is Yes (1); flag if answered No (0)
@@ -1901,6 +1895,23 @@ class RelaunchQuickQC:
                 ):
                     findings["failed_usetime_qc"].append(record_id)
                     findings["absurdity_reasons"][record_id] = "Has inconsistent answers for SP use in the past year"
+
+                # Age-of-first-use vs current age: impossible if agefirst > age_v2
+                _dose_labels = [
+                    ("micro", "threshold"), ("low", "light"), ("medium", "common"),
+                    ("heavy", "strong"), ("vheavy", "heavy"),
+                ]
+                for _dose, _dose_label in _dose_labels:
+                    if numeric_value(row, f"psyched_{_dose}_yn") != 1:
+                        continue
+                    _agefirst = numeric_value(row, f"psyched_agefirst_{_dose}")
+                    _age = numeric_value(row, "age_v2")
+                    if _agefirst > 0 and _age > 0 and _agefirst > _age:
+                        findings["failed_sp_qc"].append(record_id)
+                        findings["absurdity_reasons"][record_id] = (
+                            f"Age of first {_dose_label} dose ({int(_agefirst)}) "
+                            f"exceeds current age ({int(_age)})"
+                        )
 
         for key, value in findings.items():
             if key == "absurdity_reasons":

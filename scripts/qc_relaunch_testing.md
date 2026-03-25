@@ -956,15 +956,17 @@ Sets `kaopectamine_lifetime=1`.
 
 ---
 
-### BL-04 — Dose Mismatch Trap
+### BL-04 — SP agefirst > age_v2
 
-**What it tests:** `fraud_recent_dose=1` — calculated dose mismatch trap field set → critical fail.
+**What it tests:** `psyched_agefirst_{dose} > age_v2` — age of first use at a dose level exceeds current age → impossible → `_evaluate_absurd_sp_responses` fires `failed_sp_qc`. Tests the threshold (micro) dose; the same logic runs for all 5 dose levels.
+
+> **Note:** The `fraud_recent_dose` check that previously occupied this slot has been retired. `validity_sp_dose` and `fraud_recent_dose` have been removed from the data dictionary entirely.
 
 **Setup:**
 ```bash
 python3 qc_testing_debug.py apply BL-04
 ```
-Sets `fraud_recent_dose=1`.
+Sets `psycheduse_yn=1`, `psycheduse_life_nomic=5`, `sp_type_recent=1`, `sp_dayslastuse=400`, `psyched_micro_yn=1`, `psyched_agefirst_micro=80`.
 
 **QC script prompts:** User code: `m` | Import: `yes`
 
@@ -972,10 +974,25 @@ Sets `fraud_recent_dose=1`.
 | Field | Expected value |
 |---|---|
 | `qc_passed` | 0 |
-| `qc_notes` | (not empty) |
+| `qc_notes` | contains "threshold" and "exceeds current age" |
 
 **Verify:** `python3 qc_testing_debug.py verify BL-04`
 **Reset:** `python3 qc_testing_debug.py restore`
+
+---
+
+### REDCap-side dose consistency checks (survey-level blocking)
+
+These four checks are enforced directly in the REDCap survey as `@READONLY` required `text` fields. When the impossible condition is true the field appears, is empty, and is required — blocking submission until the participant corrects the underlying values. They are **not** tested through the QC script.
+
+| Field (per dose) | Condition | Error shown |
+|---|---|---|
+| `err_agefirst_{dose}` | `psyched_agefirst_{dose} < psychedelic_age` (non-micro only) | Age of first dose-level use predates overall first psychedelic use |
+| `err_uses_b18_{dose}` | `psyched_uses_{dose} < doses_before_18_{dose}` | Before-18 count exceeds total count |
+| `err_uses_b25_{dose}` | `psyched_uses_{dose} < doses_before_25_{dose}` | Before-25 count exceeds total count |
+| `err_b25_b18_{dose}` | `doses_before_25_{dose} < doses_before_18_{dose}` | Before-25 count is less than before-18 count |
+
+**To verify in REDCap:** Import the updated data dictionary, open the survey for a test record, enter an impossible combination (e.g., `psyched_uses_micro=5`, `doses_before_18_micro=10`), and confirm `err_uses_b18_micro` appears with the correct piped message and that the survey cannot be submitted until the values are corrected.
 
 ---
 

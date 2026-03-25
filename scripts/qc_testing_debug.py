@@ -925,14 +925,22 @@ SCENARIOS: dict[str, ScenarioSpec] = {
 ),
 
 "BL-04": ScenarioSpec(
-    "BL-04", "Dose mismatch trap (fraud_recent_dose)", "baseline",
-    "fraud_recent_dose=1 -> calculated dose mismatch trap -> critical fail.",
-    field_overrides={"fraud_recent_dose": "1"},
+    "BL-04", "SP agefirst > age_v2 (threshold dose)", "baseline",
+    "psyched_micro_yn=1 + psyched_agefirst_micro=80 (impossible given any plausible age_v2) "
+    "-> _evaluate_absurd_sp_responses fires failed_sp_qc.",
+    field_overrides={
+        "psycheduse_yn": "1", "psycheduse_life_nomic": "5",
+        "sp_type_recent": "1", "sp_dayslastuse": "400",
+        "psyched_micro_yn": "1", "psyched_agefirst_micro": "80",
+    },
     ip_config=None, task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
     prompts=["User code: m", "Import: yes"],
     expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
-    expected_fields_dupe={}, notes="",
+    expected_fields_dupe={},
+    notes="qc_notes should contain 'threshold' and 'exceeds current age'. "
+          "fraud_recent_dose check has been retired; validity_sp_dose and fraud_recent_dose "
+          "fields have been removed from the data dictionary.",
 ),
 
 "BL-05": ScenarioSpec(
