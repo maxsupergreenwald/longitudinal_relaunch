@@ -34,6 +34,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -53,9 +54,9 @@ MOCK_DRIVE_ROOT = SCRIPT_DIR / "qc_test_drive"
 MOCK_IP_PATH = MOCK_DRIVE_ROOT / "ips" / "ips_full.csv"
 MOCK_JSON_PATH = MOCK_DRIVE_ROOT / "jsons" / "failed_task_jsons_baseline.csv"
 MOCK_QC_TODO_PATH = MOCK_DRIVE_ROOT / "qc_to_dos"
-SNAPSHOT_PATH           = SCRIPT_DIR / "qc_test_snapshot.json"
-SCREENING_SNAPSHOT_PATH = SCRIPT_DIR / "qc_test_snapshot_screening.json"
-BASELINE_SNAPSHOT_PATH  = SCRIPT_DIR / "qc_test_snapshot_baseline.json"
+SNAPSHOT_PATH           = SCRIPT_DIR / "qc_test_snapshot.csv"
+SCREENING_SNAPSHOT_PATH = SCRIPT_DIR / "qc_test_snapshot_screening.csv"
+BASELINE_SNAPSHOT_PATH  = SCRIPT_DIR / "qc_test_snapshot_baseline.csv"
 TASK_PAYLOADS_PATH = SCRIPT_DIR / "qc_task_payloads.json"
 FAILED_TASK_EXAMPLES_PATH = SCRIPT_DIR.parent / "resources" / "failed_task_examples.csv"
 
@@ -92,6 +93,27 @@ _IP_COLUMNS = ["record_id", "ip", "org", "country_name", "city", "region",
 # ============================================================================
 # SECTION 2: REDCap Helpers
 # ============================================================================
+
+def _days_ago_date(n: int) -> str:
+    """Return a date n days in the past formatted as YYYY-MM-DD (REDCap API import format)."""
+    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def _resolve_field_overrides(overrides: dict) -> dict:
+    """Resolve dynamic placeholder values in a field_overrides dict.
+
+    Supported placeholders:
+      "DAYS_AGO:N"  ->  date N days before today, formatted MM/DD/YYYY
+    """
+    resolved = {}
+    for field, value in overrides.items():
+        if isinstance(value, str) and value.startswith("DAYS_AGO:"):
+            n = int(value.split(":")[1])
+            resolved[field] = _days_ago_date(n)
+        else:
+            resolved[field] = value
+    return resolved
+
 
 def _get_project() -> Project:
     return Project(REDCAP_API_URL, RELAUNCH_API_TOKEN)
@@ -256,18 +278,14 @@ def cmd_setup() -> None:
     (MOCK_DRIVE_ROOT / "jsons").mkdir(exist_ok=True)
     MOCK_QC_TODO_PATH.mkdir(exist_ok=True)
 
-    _write_ip_csv([IP_CLEAN])
+    _write_ip_csv([])  # Empty — no placeholder IPs; real copy-paste flow will populate
 
     json_headers = ["record_id", "task", "fail_reason", "fail_attempt", "json_string"]
     with open(MOCK_JSON_PATH, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=json_headers).writeheader()
 
     print("Mock shared drive created at:", MOCK_DRIVE_ROOT)
-    print()
-    print("Before running the QC script, export this env variable:")
-    print(f"  export AIM8_SHAREDDRIVE_PATH={MOCK_DRIVE_ROOT}")
-    print()
-    print("Next: python3 qc_testing_debug.py snapshot   (after record_id=1 is ready)")
+    print("Next: python3 qc_testing_debug.py snapshot screening   (after record_id=1 is ready)")
 
 
 # ============================================================================
@@ -284,11 +302,13 @@ def _snapshot_path(stage: str | None) -> Path:
 def cmd_snapshot(stage: str | None = None) -> None:
     path = _snapshot_path(stage)
     print(f"Exporting record {TEST_RECORD_ID} from REDCap...")
-    record = redcap_export_record(TEST_RECORD_ID)
-    with open(path, "w") as f:
-        json.dump(record, f, indent=2)
+    project = _get_project()
+    df = project.export_records(records=[TEST_RECORD_ID], format_type="df")
+    if df.empty:
+        raise RuntimeError(f"Record {TEST_RECORD_ID} not found in REDCap.")
+    df.to_csv(path, index=False)
     label = f" ({stage})" if stage else ""
-    print(f"Snapshot{label} saved to {path} ({len(record)} fields).")
+    print(f"Snapshot{label} saved to {path} ({df.shape[1]} fields).")
 
 
 def cmd_restore(stage: str | None = None) -> None:
@@ -300,8 +320,8 @@ def cmd_restore(stage: str | None = None) -> None:
         print(f"Run: python3 qc_testing_debug.py {hint}")
         sys.exit(1)
 
-    with open(path) as f:
-        snapshot = json.load(f)
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    snapshot = df.iloc[0].to_dict()
 
     print(f"Restoring record {TEST_RECORD_ID} from snapshot ({len(snapshot)} fields)...")
     redcap_import_fields(TEST_RECORD_ID, snapshot)
@@ -363,13 +383,219 @@ class ScenarioSpec:
     notes: str
 
 
+_REDCAP_RECORD_URL = (
+    "https://redcap.research.yale.edu/redcap_v15.5.36/index.php"
+    "?pid=936&route=DataEntryController:index&id=1&page=screening_result"
+)
+
 SCENARIOS: dict[str, ScenarioSpec] = {
 
 # ---------------------------------------------------------------------------
-# SCREENING SCENARIOS
+# STAGE 0: ELIGIBILITY SCENARIOS  (ELIG-XX)
+# ---------------------------------------------------------------------------
+# Purpose: verify that REDCap's branching/eligibility logic correctly blocks
+# ineligible participants before submit_screen_v3 fires, and correctly allows
+# eligible edge cases through.
+#
+# Workflow: apply ELIG-XX → navigate to record in REDCap → confirm → auto-restore
+# No QC script run needed. Verification is manual (see notes on each scenario).
+
+"ELIG-00": ScenarioSpec(
+    "ELIG-00", "Age too old", "eligibility",
+    "age_v2=70 — record should be blocked by [age_v2]<65 eligibility criterion.",
+    field_overrides={"age_v2": "70"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — inelig_age_old descriptive field should be visible in screening_result.",
+),
+
+"ELIG-01": ScenarioSpec(
+    "ELIG-01", "Age too young", "eligibility",
+    "age_v2=16 — record should be blocked by [age_v2]>17 eligibility criterion.",
+    field_overrides={"age_v2": "16"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — inelig_age_young descriptive field should be visible in screening_result.",
+),
+
+"ELIG-02": ScenarioSpec(
+    "ELIG-02", "Cognition screener failed", "eligibility",
+    "cognition_screener_v2=1 — blocked by [cognition_screener_v2]='0'.",
+    field_overrides={"cognition_screener_v2": "1"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — cognition ineligibility message should appear in screening_result.",
+),
+
+"ELIG-03": ScenarioSpec(
+    "ELIG-03", "Seizure history", "eligibility",
+    "seizure_hx_v2=1 — blocked by [seizure_hx_v2]='0'.",
+    field_overrides={"seizure_hx_v2": "1"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — seizure ineligibility message should appear in screening_result.",
+),
+
+"ELIG-04": ScenarioSpec(
+    "ELIG-04", "Intoxication at intake", "eligibility",
+    "intox_screen_v2=1 — blocked by [intox_screen_v2]='0'.",
+    field_overrides={"intox_screen_v2": "1"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — intoxication ineligibility message should appear in screening_result.",
+),
+
+"ELIG-05": ScenarioSpec(
+    "ELIG-05", "No computer access", "eligibility",
+    "no_computer=1 — blocked by [no_computer]='0'.",
+    field_overrides={"no_computer": "1"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — no-computer ineligibility message should appear in screening_result.",
+),
+
+"ELIG-06": ScenarioSpec(
+    "ELIG-06", "Raven score too low", "eligibility",
+    "raven_total_score_v2=0 — blocked by [raven_total_score_v2]>0.",
+    field_overrides={"raven_total_score_v2": "0"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — Raven ineligibility message should appear in screening_result.",
+),
+
+"ELIG-07": ScenarioSpec(
+    "ELIG-07", "Geographic criterion not met", "eligibility",
+    "geo_crit='' — blocked by [geo_crit]<>''.",
+    field_overrides={"geo_crit": ""}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — geographic ineligibility message should appear in screening_result.",
+),
+
+"ELIG-08": ScenarioSpec(
+    "ELIG-08", "No prior psychedelic use", "eligibility",
+    "psycheduse_yn=2 — no serotonergic psychedelic use endorsed; sp_dayslastuse will be blank.",
+    field_overrides={"psycheduse_yn": "2"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — sp-use ineligibility message should appear in screening_result.",
+),
+
+"ELIG-09": ScenarioSpec(
+    "ELIG-09", "English fluency not met", "eligibility",
+    "english_fluency=0 — not fluent in English.",
+    field_overrides={"english_fluency": "0"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — English fluency ineligibility message should appear in screening_result.",
+),
+
+"ELIG-10": ScenarioSpec(
+    "ELIG-10", "SP used within 6 weeks, NOT willing to wait", "eligibility",
+    "sp_dayslastuse_date set to 30 days ago — sp_dayslastuse calc becomes ~30; fails SP timing criterion.",
+    field_overrides={"sp_dayslastuse_date": "DAYS_AGO:30"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes=(
+        "EXPECT INELIGIBLE — inelig_sp_recentuse descriptive field should be visible. "
+        "submit_screen_v3 should NOT be accessible."
+    ),
+),
+
+"ELIG-11": ScenarioSpec(
+    "ELIG-11", "SP used within 6 weeks, WILLING to wait", "eligibility",
+    "sp_dayslastuse_date set to 30 days ago, psychedelic_abstinence_yn=1 — passes via the wait path.",
+    field_overrides={"sp_dayslastuse_date": "DAYS_AGO:30", "psychedelic_abstinence_yn": "1"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes=(
+        "EXPECT ELIGIBLE — submit_screen_v3 should be accessible. "
+        "inelig_sp_recentuse should NOT be visible. days_to_eligible should show ~12 days."
+    ),
+),
+
+"ELIG-12": ScenarioSpec(
+    "ELIG-12", "Salvia used within 6 weeks, NOT willing to wait", "eligibility",
+    "salvia_lifetime=1, salvia_dayslastuse_date set to 14 days ago — atypical_recentuse calc fires; not willing to wait.",
+    field_overrides={"salvia_lifetime": "1", "salvia_dayslastuse_date": "DAYS_AGO:14"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — inelig_atypical descriptive field should be visible.",
+),
+
+"ELIG-13": ScenarioSpec(
+    "ELIG-13", "Salvia used within 6 weeks, WILLING to wait", "eligibility",
+    "salvia_lifetime=1, salvia_dayslastuse_date set to 14 days ago, psychedelic_abstinence_yn=1 — wait path.",
+    field_overrides={"salvia_lifetime": "1", "salvia_dayslastuse_date": "DAYS_AGO:14", "psychedelic_abstinence_yn": "1"},
+    ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes=(
+        "EXPECT ELIGIBLE — submit_screen_v3 should be accessible. "
+        "inelig_atypical should NOT be visible. days_to_eligible should show ~28 days."
+    ),
+),
+
+"ELIG-14": ScenarioSpec(
+    "ELIG-14", "MDMA used within 6 weeks, NOT willing to wait", "eligibility",
+    "mdma_lifetime=1, mdma_dayslastuse_date set to 14 days ago — atypical_recentuse calc fires; not willing to wait.",
+    field_overrides={"mdma_lifetime": "1", "mdma_dayslastuse_date": "DAYS_AGO:14"}, ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes="EXPECT INELIGIBLE — inelig_atypical descriptive field should be visible.",
+),
+
+"ELIG-15": ScenarioSpec(
+    "ELIG-15", "MDMA used within 6 weeks, WILLING to wait", "eligibility",
+    "mdma_lifetime=1, mdma_dayslastuse_date set to 14 days ago, psychedelic_abstinence_yn=1 — wait path.",
+    field_overrides={"mdma_lifetime": "1", "mdma_dayslastuse_date": "DAYS_AGO:14", "psychedelic_abstinence_yn": "1"},
+    ip_config=None,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=[],
+    expected_fields={}, expected_fields_dupe={},
+    notes=(
+        "EXPECT ELIGIBLE — submit_screen_v3 should be accessible. "
+        "inelig_atypical should NOT be visible. days_to_eligible should show ~28 days."
+    ),
+),
+
+# ---------------------------------------------------------------------------
+# STAGE 1: SCREENING FRAUD DETECTION SCENARIOS  (SCR-XX)
 # ---------------------------------------------------------------------------
 # All require: submit_screen_v3 present, screening_pass/qc_passed null,
 # phone_number present, ip_zoom_invite null.
+# Workflow: apply SCR-XX → run QC script → verify SCR-XX → restore screening
 
 "SCR-00": ScenarioSpec(
     "SCR-00", "Passes screening", "screening",
@@ -384,133 +610,10 @@ SCENARIOS: dict[str, ScenarioSpec] = {
 ),
 
 "SCR-01": ScenarioSpec(
-    "SCR-01", "Age too old", "screening",
-    "age_v2=70 triggers 'Age above 65' hard fail.",
-    field_overrides={"age_v2": "70"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={},
-    notes="Hard fail before phone review — no phone verdict prompt.",
-),
-
-"SCR-02": ScenarioSpec(
-    "SCR-02", "Age too young", "screening",
-    "age_v2=16 triggers 'Age below 18' hard fail.",
-    field_overrides={"age_v2": "16"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-03": ScenarioSpec(
-    "SCR-03", "Cognition screener failed", "screening",
-    "cognition_screener_v2=1 triggers hard fail.",
-    field_overrides={"cognition_screener_v2": "1"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-04": ScenarioSpec(
-    "SCR-04", "Seizure history", "screening",
-    "seizure_hx_v2=1 triggers hard fail.",
-    field_overrides={"seizure_hx_v2": "1"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-05": ScenarioSpec(
-    "SCR-05", "Intoxication at intake", "screening",
-    "intox_screen_v2=1 triggers hard fail.",
-    field_overrides={"intox_screen_v2": "1"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-06": ScenarioSpec(
-    "SCR-06", "No psychedelic use", "screening",
-    "psycheduse_yn=2 triggers 'Did not endorse serotonergic psychedelic use' hard fail.",
-    field_overrides={"psycheduse_yn": "2"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-07": ScenarioSpec(
-    "SCR-07", "Raven score too low", "screening",
-    "raven_total_score_v2=0 triggers 'Raven score below minimum' hard fail.",
-    field_overrides={"raven_total_score_v2": "0"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-08": ScenarioSpec(
-    "SCR-08", "No computer access", "screening",
-    "no_computer=1 triggers hard fail.",
-    field_overrides={"no_computer": "1"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-09": ScenarioSpec(
-    "SCR-09", "English fluency not met", "screening",
-    "english_fluency=0 triggers hard fail.",
-    field_overrides={"english_fluency": "0"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-10": ScenarioSpec(
-    "SCR-10", "Geographic fraud flag", "screening",
-    "Clears geo_crit — pd.isna() check in script fires 'Geographic fraud flag' hard fail.",
-    field_overrides={"geo_crit": ""}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={},
-    notes="Script checks pd.isna(row.get('geo_crit', np.nan)). Blank string in REDCap exports as NaN.",
-),
-
-"SCR-11": ScenarioSpec(
-    "SCR-11", "Recent SP use (within 42 days)", "screening",
-    "sp_lastuse_days_screen=30 triggers 'Reported SP/atypical use within the last 42 days' hard fail.",
-    field_overrides={"sp_lastuse_days_screen": "30"}, ip_config=IP_CLEAN,
-    task_data_payload=None, task_data_field=None,
-    uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
-    expected_fields={"screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1"},
-    expected_fields_dupe={}, notes="",
-),
-
-"SCR-11b": ScenarioSpec(
-    "SCR-11b", "Recent SP use, willing to wait (clean)", "screening",
-    "sp_dayslastuse=30 AND psychedelic_abstinence_yn=1 AND clean IP/phone -> sp_wait path -> "
-    "screening_pass=1, eligible_afterwait_notify=1 (NOT eligible_notify).",
-    field_overrides={"sp_dayslastuse": "30", "psychedelic_abstinence_yn": "1"}, ip_config=IP_CLEAN,
+    "SCR-01", "Recent SP use, willing to wait (clean)", "screening",
+    "sp_dayslastuse_date set to 30 days ago, psychedelic_abstinence_yn=1, clean IP/phone -> "
+    "sp_wait path -> screening_pass=1, eligible_afterwait_notify=1 (NOT eligible_notify).",
+    field_overrides={"sp_dayslastuse_date": "DAYS_AGO:30", "psychedelic_abstinence_yn": "1"}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
     prompts=["User code: m", "Phone verdict: n (clear)", "Import: yes"],
@@ -519,11 +622,11 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="eligible_notify must remain blank. eligible_afterwait_notify=1 sends the deferred invitation.",
 ),
 
-"SCR-11c": ScenarioSpec(
-    "SCR-11c", "Recent SP use, willing to wait, fraudulent phone", "screening",
-    "sp_dayslastuse=30, psychedelic_abstinence_yn=1 (willing to wait), but user enters 'y' at "
-    "phone verdict -> normal fraud path. sp_wait does NOT protect against explicit phone fraud.",
-    field_overrides={"sp_dayslastuse": "30", "psychedelic_abstinence_yn": "1"}, ip_config=IP_CLEAN,
+"SCR-02": ScenarioSpec(
+    "SCR-02", "Recent SP use, willing to wait, fraudulent phone", "screening",
+    "sp_dayslastuse_date set to 30 days ago, psychedelic_abstinence_yn=1 (willing to wait), but "
+    "user enters 'y' at phone verdict -> normal fraud path. sp_wait does NOT protect against explicit phone fraud.",
+    field_overrides={"sp_dayslastuse_date": "DAYS_AGO:30", "psychedelic_abstinence_yn": "1"}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
     prompts=["User code: m", "Phone verdict: y (fraudulent/VOIP)", "Import: yes"],
@@ -535,11 +638,11 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="eligible_afterwait_notify must remain blank — phone fraud overrides the wait path.",
 ),
 
-"SCR-11d": ScenarioSpec(
-    "SCR-11d", "Recent atypical use, willing to wait (clean)", "screening",
-    "SP dayslastuse is fine (>42) but mdma_dayslastuse=10 triggers atypical_recentuse calc -> "
+"SCR-03": ScenarioSpec(
+    "SCR-03", "Recent MDMA use, willing to wait (clean)", "screening",
+    "mdma_lifetime=1, mdma_dayslastuse_date set to 14 days ago -> atypical_recentuse calc fires -> "
     "sp_wait path. psychedelic_abstinence_yn=1 -> screening_pass=1, eligible_afterwait_notify=1.",
-    field_overrides={"mdma_lifetime": "1", "mdma_dayslastuse": "10", "psychedelic_abstinence_yn": "1"},
+    field_overrides={"mdma_lifetime": "1", "mdma_dayslastuse_date": "DAYS_AGO:14", "psychedelic_abstinence_yn": "1"},
     ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
@@ -547,14 +650,13 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     expected_fields={"screening_pass": "1", "eligible_afterwait_notify": "1", "eligible_notify": None},
     expected_fields_dupe={},
     notes=(
-        "atypical_recentuse is a REDCap calc field that fires when atypical substance use is "
-        "recent. If the calc doesn't update from just setting mdma_dayslastuse, set "
-        "atypical_recentuse=1 directly in field_overrides as a fallback."
+        "mdma_dayslastuse_date triggers the mdma_dayslastuse calc, which feeds atypical_recentuse. "
+        "If atypical_recentuse doesn't fire (REDCap calc lag), set atypical_recentuse=1 directly as a fallback."
     ),
 ),
 
-"SCR-12": ScenarioSpec(
-    "SCR-12", "Duplicate email", "screening",
+"SCR-04": ScenarioSpec(
+    "SCR-04", "Duplicate email", "screening",
     "email_rpt on record 1 matches a prior record's email (record 9998). "
     "apply() injects record 9998 with the same email and datedone_screening_survey set.",
     field_overrides={"email_rpt": "dupe_test@example.com"}, ip_config=IP_CLEAN,
@@ -567,12 +669,12 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         "HOW IT WORKS: apply() imports email_rpt=dupe_test@example.com to record 1. "
         "It also imports to record 9998: email_rpt=dupe_test@example.com + "
         "datedone_screening_survey=2025-01-01 (marks it as a 'prior screened' record). "
-        "_apply_duplicate_identity_checks() finds the email match in historic records -> hard fail."
+        "_apply_duplicate_identity_checks() finds the email match -> hard fail."
     ),
 ),
 
-"SCR-13": ScenarioSpec(
-    "SCR-13", "Forbidden IP org", "screening",
+"SCR-05": ScenarioSpec(
+    "SCR-05", "Forbidden IP org", "screening",
     "IP org is AS174 Cogent Communications — in FORBIDDEN_IP_ORGS set.",
     field_overrides={}, ip_config=IP_FORBIDDEN_ORG,
     task_data_payload=None, task_data_field=None,
@@ -583,8 +685,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="Only ips_full.csv is modified. No REDCap field overrides needed.",
 ),
 
-"SCR-14": ScenarioSpec(
-    "SCR-14", "Forbidden IP country", "screening",
+"SCR-06": ScenarioSpec(
+    "SCR-06", "Forbidden IP country", "screening",
     "IP country_name=Nigeria — in FORBIDDEN_IP_COUNTRIES set.",
     field_overrides={}, ip_config=IP_FORBIDDEN_COUNTRY,
     task_data_payload=None, task_data_field=None,
@@ -595,8 +697,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="Only ips_full.csv is modified.",
 ),
 
-"SCR-15": ScenarioSpec(
-    "SCR-15", "Suspicious duplicate IP", "screening",
+"SCR-07": ScenarioSpec(
+    "SCR-07", "Suspicious duplicate IP", "screening",
     "Record 1 and prior record 9998 share IP 5.5.5.5 (non-safe org). "
     "Record passes automated checks but ip_zoom_invite=1 is set alongside screening_pass=1.",
     field_overrides={}, ip_config=IP_PRIOR_BAD,
@@ -606,15 +708,15 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     expected_fields={"screening_pass": "1", "eligible_notify": "1", "ip_zoom_invite": "1"},
     expected_fields_dupe={},
     notes=(
-        "HOW IT WORKS: apply() sets record 1 IP to 5.5.5.5 (AS15169 Google — not safe-duplicate). "
-        "It also adds record 9998 to ips_full.csv with IP=5.5.5.5 and imports "
-        "datedone_screening_survey=2025-01-01 + qc_passed=0 to record 9998 (marks it as "
-        "'already reviewed ineligible'). prior_bad_ips now includes 5.5.5.5 -> suspicious IP flag."
+        "HOW IT WORKS: apply() sets record 1 IP to 5.5.5.5. "
+        "Adds record 9998 to ips_full.csv with IP=5.5.5.5 and imports "
+        "datedone_screening_survey=2025-01-01 + qc_passed=0 (marks it as 'reviewed ineligible'). "
+        "prior_bad_ips now includes 5.5.5.5 -> suspicious IP flag."
     ),
 ),
 
-"SCR-16": ScenarioSpec(
-    "SCR-16", "Phone verdict: VOIP/fraudulent", "screening",
+"SCR-08": ScenarioSpec(
+    "SCR-08", "Phone verdict: VOIP/fraudulent", "screening",
     "Record passes automated checks. User enters 'y' at phone verdict prompt -> hard fail.",
     field_overrides={}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
@@ -625,8 +727,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="No field overrides — only the 'y' phone verdict causes the fail.",
 ),
 
-"SCR-17": ScenarioSpec(
-    "SCR-17", "Phone verdict: manual follow-up", "screening",
+"SCR-09": ScenarioSpec(
+    "SCR-09", "Phone verdict: manual follow-up", "screening",
     "Record passes automated checks. User enters '?' -> max_number_followup=1. NOT a fail.",
     field_overrides={}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
@@ -637,8 +739,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="screening_pass and qc_passed should remain blank — verify they are NOT set.",
 ),
 
-"SCR-18": ScenarioSpec(
-    "SCR-18", "Missing IP metadata", "screening",
+"SCR-10": ScenarioSpec(
+    "SCR-10", "Missing IP metadata", "screening",
     "IP row for record 1 deleted from ips_full.csv. Record goes to manual_followup.",
     field_overrides={}, ip_config=_IP_MISSING,
     task_data_payload=None, task_data_field=None,
@@ -651,10 +753,9 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="screening_pass and qc_passed should remain blank.",
 ),
 
-"SCR-19": ScenarioSpec(
-    "SCR-19", "Fake drug endorsed at screening (kaopectamine)", "screening",
-    "kaopectamine_lifetime=1 triggers 'Endorsed fake drug (kaopectamine) during screening' hard fail "
-    "in _apply_screening_eligibility_rules. Distinct from BL-03 (same trap caught at baseline QC).",
+"SCR-11": ScenarioSpec(
+    "SCR-11", "Fake drug endorsed at screening (kaopectamine)", "screening",
+    "kaopectamine_lifetime=1 triggers 'Endorsed fake drug (kaopectamine) during screening' hard fail.",
     field_overrides={"kaopectamine_lifetime": "1"}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
@@ -667,8 +768,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="Hard fail before phone verdict — no phone verdict prompt.",
 ),
 
-"SCR-20": ScenarioSpec(
-    "SCR-20", "AI prompt injection field filled (flexibility_yn)", "screening",
+"SCR-12": ScenarioSpec(
+    "SCR-12", "AI prompt injection field filled (flexibility_yn)", "screening",
     "flexibility_yn='ok' — the @HIDDEN-SURVEY honeypot field was filled in. "
     "Normal participants never see it; AI agents parsing raw HTML may follow the embedded instruction.",
     field_overrides={"flexibility_yn": "ok"}, ip_config=IP_CLEAN,
@@ -683,8 +784,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="Hard fail before phone verdict — no phone verdict prompt.",
 ),
 
-"SCR-21": ScenarioSpec(
-    "SCR-21", "Screening completed too quickly (screen_seconds_taken < 90)", "screening",
+"SCR-13": ScenarioSpec(
+    "SCR-13", "Screening completed too quickly (screen_seconds_taken < 90)", "screening",
     "screen_seconds_taken=45 triggers 'Completed screening suspiciously fast' hard fail.",
     field_overrides={"screen_seconds_taken": "45"}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
@@ -698,60 +799,74 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="Hard fail before phone verdict — no phone verdict prompt.",
 ),
 
-"SCR-22": ScenarioSpec(
-    "SCR-22", "screen_motive exactly 500 characters (length heuristic only)", "screening",
+"SCR-14": ScenarioSpec(
+    "SCR-14", "screen_motive exactly 500 characters (length heuristic only)", "screening",
     "screen_motive is exactly 500 characters but does NOT begin with the AI template phrase. "
-    "Fires heuristic 1 only: 'response is exactly 500 characters'.",
+    "AI_MOTIVE_AUTOFAIL=False (default): record goes to phone review with a red warning banner; "
+    "researcher enters 'y' to manually fail. Fires heuristic 1 only: 'response is exactly 500 characters'.",
     field_overrides={"screen_motive": "a" * 500}, ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
+    prompts=["User code: m", "Import: yes", "Phone verdict: y"],
     expected_fields={
         "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
         "qc_notes": "CONTAINS:exactly 500 characters",
     },
     expected_fields_dupe={},
-    notes="Hard fail before phone verdict. Confirm qc_notes does NOT mention 'AI template phrase'.",
+    notes=(
+        "AI_MOTIVE_AUTOFAIL=False (default): record passes to phone review. "
+        "Confirm a red warning banner prints before the phone verdict prompt. "
+        "Enter 'y' at the phone verdict prompt to manually fail. "
+        "Confirm qc_notes does NOT mention 'AI template phrase'."
+    ),
 ),
 
-"SCR-23": ScenarioSpec(
-    "SCR-23", "screen_motive AI template phrase — 490 chars (phrase heuristic only)", "screening",
+"SCR-15": ScenarioSpec(
+    "SCR-15", "screen_motive AI template phrase — 490 chars (phrase heuristic only)", "screening",
     "screen_motive starts with 'I would describe my personal motivation' and is 490 chars (in "
-    "476–524 range) but NOT exactly 500. Fires heuristic 2 only: 'begins with AI template phrase'.",
+    "476–524 range) but NOT exactly 500. "
+    "AI_MOTIVE_AUTOFAIL=False (default): record goes to phone review with a red warning banner; "
+    "researcher enters 'y' to manually fail. Fires heuristic 2 only: 'begins with AI template phrase'.",
     field_overrides={"screen_motive": "I would describe my personal motivation" + "x" * 452},
     ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
+    prompts=["User code: m", "Import: yes", "Phone verdict: y"],
     expected_fields={
         "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
         "qc_notes": "CONTAINS:AI template phrase",
     },
     expected_fields_dupe={},
     notes=(
-        "Hard fail before phone verdict. screen_motive value is 490 chars (38 + 452). "
+        "AI_MOTIVE_AUTOFAIL=False (default): record passes to phone review. "
+        "Confirm a red warning banner prints before the phone verdict prompt. "
+        "Enter 'y' at the phone verdict prompt to manually fail. "
+        "screen_motive value is 490 chars (38 + 452). "
         "Confirm qc_notes does NOT mention 'exactly 500 characters'."
     ),
 ),
 
-"SCR-24": ScenarioSpec(
-    "SCR-24", "screen_motive both AI flags (500 chars + template phrase)", "screening",
+"SCR-16": ScenarioSpec(
+    "SCR-16", "screen_motive both AI flags (500 chars + template phrase)", "screening",
     "screen_motive starts with 'I would describe my personal motivation' AND is exactly 500 chars. "
-    "Both heuristics fire; both reasons are semicolon-joined in qc_notes.",
+    "Both heuristics fire; both reasons appear in the warning banner and semicolon-joined in qc_notes. "
+    "AI_MOTIVE_AUTOFAIL=False (default): record goes to phone review; researcher enters 'y' to manually fail.",
     field_overrides={"screen_motive": "I would describe my personal motivation" + "x" * 462},
     ip_config=IP_CLEAN,
     task_data_payload=None, task_data_field=None,
     uses_dupe_record=False, dupe_task_field=None,
-    prompts=["User code: m", "Import: yes"],
+    prompts=["User code: m", "Import: yes", "Phone verdict: y"],
     expected_fields={
         "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
         "qc_notes": "CONTAINS:AI template phrase",
     },
     expected_fields_dupe={},
     notes=(
-        "Hard fail before phone verdict. screen_motive value is exactly 500 chars (38 + 462). "
-        "qc_notes should contain both 'exactly 500 characters' AND 'AI template phrase' "
-        "semicolon-joined."
+        "AI_MOTIVE_AUTOFAIL=False (default): record passes to phone review. "
+        "Confirm both flag lines appear in the red warning banner. "
+        "Enter 'y' at the phone verdict prompt to manually fail. "
+        "screen_motive value is exactly 500 chars (38 + 462). "
+        "qc_notes should contain both 'exactly 500 characters' AND 'AI template phrase' semicolon-joined."
     ),
 ),
 
@@ -1150,14 +1265,156 @@ SCENARIOS: dict[str, ScenarioSpec] = {
 # SECTION 7: Apply Command
 # ============================================================================
 
+# REDCap fields that trigger participant-facing alerts, and their plain-English labels.
+_ALERT_FIELDS: dict[str, str] = {
+    "eligible_notify":           "Eligible — immediate baseline invitation sent",
+    "eligible_afterwait_notify": "Eligible after wait — invite sent at continue_date",
+    "ineligibile_fraud":         "Ineligible/fraud — rejection notification sent",
+    "ip_zoom_invite":            "Suspicious IP — Zoom verification follow-up triggered",
+    "max_number_followup":       "Flagged for Max manual review",
+    "send_pay_confirm":          "Payment confirmation alert sent",
+    "replay_links_ach":          "ACH replay link alert sent (slot 1)",
+    "replay_links_vch":          "VCH replay link alert sent (slot 1)",
+    "replay_links_prl":          "PRL replay link alert sent (slot 1)",
+    "fourth_fail":               "All 4 replay slots exhausted — fourth_fail alert",
+    "verify_emailed":            "SP verification survey emailed",
+}
+
+
+def _hyperlink(url: str, text: str) -> str:
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
+def _print_scenario_checklist(spec: ScenarioSpec) -> None:
+    """Print a human-readable checklist of what was set up and what to verify."""
+    sid = spec.scenario_id
+    print()
+    print("=" * 60)
+    print(f"SCENARIO {sid}: {spec.name}")
+    print(f"  {spec.description}")
+    print("=" * 60)
+
+    # --- What was modified ---
+    print("\nMODIFICATIONS APPLIED:")
+    if spec.field_overrides:
+        resolved = _resolve_field_overrides(spec.field_overrides)
+        for field, value in resolved.items():
+            raw = spec.field_overrides[field]
+            if raw != value:
+                display = f"{repr(value)}  (from {raw})"
+            else:
+                display = repr(value) if len(str(value)) <= 60 else repr(str(value)[:57] + "...")
+            print(f"  {field} = {display}")
+    else:
+        print("  (none — uses clean snapshot record as-is)")
+
+    if spec.ip_config is _IP_MISSING:
+        print("  IP row deleted from ips_full.csv")
+    elif spec.ip_config is not None:
+        org = spec.ip_config.get("org", "?")
+        ip  = spec.ip_config.get("ip", "?")
+        print(f"  IP set to {ip}  ({org})")
+
+    if spec.uses_dupe_record:
+        print(f"  Dupe record {DUPE_RECORD_ID} configured")
+
+    record_link = _hyperlink(_REDCAP_RECORD_URL, "Open record in REDCap")
+
+    # ---------------------------------------------------------------
+    # ELIG scenarios: manual REDCap check only — no QC script needed
+    # ---------------------------------------------------------------
+    if spec.category == "eligibility":
+        print("\nWHAT TO CHECK IN REDCAP:")
+        print(f"  {spec.notes}")
+        print()
+        print(f"  {record_link}")
+        print()
+        print("  Press Enter here once you've verified -> script will auto-restore.")
+
+        all_ids = list(SCENARIOS.keys())
+        idx = all_ids.index(sid) if sid in all_ids else -1
+        if 0 <= idx < len(all_ids) - 1:
+            next_id = all_ids[idx + 1]
+            next_spec = SCENARIOS[next_id]
+            print()
+            print(f"NEXT UP: {next_id} — {next_spec.name}")
+            print(f"  {next_spec.description}")
+        return
+
+    # ---------------------------------------------------------------
+    # SCR / BL scenarios: automated QC script + field verification
+    # ---------------------------------------------------------------
+
+    # --- What to check after running the QC script ---
+    print("\nEXPECTED OUTCOME (verify after QC run):")
+
+    key_fields   = ["screening_pass", "qc_passed", "qc_notes"]
+    other_fields = {k: v for k, v in spec.expected_fields.items() if k not in key_fields}
+    alert_hits   = {k: v for k, v in other_fields.items() if k in _ALERT_FIELDS and v == "1"}
+    data_fields  = {k: v for k, v in other_fields.items() if k not in _ALERT_FIELDS}
+
+    for field in key_fields:
+        if field not in spec.expected_fields:
+            continue
+        val = spec.expected_fields[field]
+        if val is None:
+            display = "(blank / not set)"
+        elif isinstance(val, str) and val.startswith("CONTAINS:"):
+            display = f'contains "{val[len("CONTAINS:"):]}"'
+        else:
+            display = repr(val)
+        print(f"  {field:<22} {display}")
+
+    if alert_hits:
+        print("\n  ALERTS TRIGGERED:")
+        for field, _ in alert_hits.items():
+            print(f"    [✓] {_ALERT_FIELDS[field]}")
+    else:
+        print("\n  ALERTS TRIGGERED: none")
+
+    if data_fields:
+        print("\n  OTHER FIELDS SET:")
+        for field, val in data_fields.items():
+            if val is None:
+                display = "(blank / not set)"
+            elif isinstance(val, str) and val.startswith("CONTAINS:"):
+                display = f'contains "{val[len("CONTAINS:"):]}"'
+            else:
+                display = repr(val)
+            print(f"    {field:<26} {display}")
+
+    # --- Prompts ---
+    print("\nPROMPTS DURING QC SCRIPT:")
+    for p in spec.prompts:
+        print(f"  > {p}")
+
+    # --- Next steps ---
+    restore_cmd = "restore baseline" if spec.category == "baseline" else "restore screening"
+    print()
+    print(f"  python3 quickQC_api_calling_v7_relaunch.py")
+    print(f"  python3 qc_testing_debug.py verify {sid}")
+    print(f"  python3 qc_testing_debug.py {restore_cmd}")
+
+    # --- What comes next ---
+    all_ids = list(SCENARIOS.keys())
+    idx = all_ids.index(sid) if sid in all_ids else -1
+    if 0 <= idx < len(all_ids) - 1:
+        next_id = all_ids[idx + 1]
+        next_spec = SCENARIOS[next_id]
+        print()
+        print(f"NEXT UP: {next_id} — {next_spec.name}")
+        print(f"  {next_spec.description}")
+
+
 def cmd_apply(scenario_id: str) -> None:
     spec = _get_scenario(scenario_id)
     print(f"\nSetting up {scenario_id}: {spec.name}")
     print("=" * 60)
 
     if spec.field_overrides:
-        print(f"Importing {len(spec.field_overrides)} field override(s) to record {TEST_RECORD_ID}...")
-        redcap_import_fields(TEST_RECORD_ID, spec.field_overrides)
+        resolved = _resolve_field_overrides(spec.field_overrides)
+        print(f"Importing {len(resolved)} field override(s) to record {TEST_RECORD_ID}...")
+        redcap_import_fields(TEST_RECORD_ID, resolved)
 
     # Update ips_full.csv
     if spec.ip_config is None:
@@ -1179,18 +1436,16 @@ def cmd_apply(scenario_id: str) -> None:
     if spec.uses_dupe_record:
         _setup_dupe_record(spec, scenario_id)
 
-    print(f"\nSetup complete. Now run the QC script:")
-    print(f"  export AIM8_SHAREDDRIVE_PATH={MOCK_DRIVE_ROOT}")
-    print(f"  python3 quickQC_api_calling_v7_relaunch.py")
-    print()
-    for p in spec.prompts:
-        print(f"  > {p}")
-    print()
-    print(f"Then: python3 qc_testing_debug.py verify {scenario_id}")
+    _print_scenario_checklist(spec)
+
+    if spec.category == "eligibility":
+        input("\n  Press Enter to auto-restore and continue... ")
+        print()
+        cmd_restore("screening")
 
 
 def _setup_dupe_record(spec: ScenarioSpec, scenario_id: str) -> None:
-    if scenario_id == "SCR-12":
+    if scenario_id == "SCR-04":
         # Inject a prior record matching the email on record 1
         print(f"Injecting prior record {DUPE_RECORD_ID} with duplicate email...")
         redcap_import_fields(DUPE_RECORD_ID, {
@@ -1201,7 +1456,7 @@ def _setup_dupe_record(spec: ScenarioSpec, scenario_id: str) -> None:
         })
         return
 
-    if scenario_id == "SCR-15":
+    if scenario_id == "SCR-07":
         # Add a row to ips_full.csv for record 9998 with same IP, and mark it as reviewed
         print(f"Adding prior-reviewed record {DUPE_RECORD_ID} to ips_full.csv with IP=5.5.5.5...")
         _update_ip_row(DUPE_RECORD_ID, {**_IP_BASE, "record_id": DUPE_RECORD_ID, "ip": "5.5.5.5"})
@@ -1241,6 +1496,11 @@ def cmd_verify(scenario_id: str) -> None:
     spec = _get_scenario(scenario_id)
     print(f"\nVerifying {scenario_id}: {spec.name}")
     print("=" * 60)
+
+    if spec.category == "eligibility":
+        print("ELIG scenarios are verified manually in REDCap — no automated field checks.")
+        print(f"Run: python3 qc_testing_debug.py apply {scenario_id}  (includes auto-restore)")
+        return
 
     record = redcap_export_record(TEST_RECORD_ID)
     all_pass = _check_fields(record, spec.expected_fields, TEST_RECORD_ID)
@@ -1298,8 +1558,9 @@ def _check_fields(record: dict, expected: dict, record_id: int) -> bool:
 # ============================================================================
 
 def cmd_list() -> None:
-    scr = [(sid, s) for sid, s in SCENARIOS.items() if s.category == "screening"]
-    bl = [(sid, s) for sid, s in SCENARIOS.items() if s.category == "baseline"]
+    elig = [(sid, s) for sid, s in SCENARIOS.items() if s.category == "eligibility"]
+    scr  = [(sid, s) for sid, s in SCENARIOS.items() if s.category == "screening"]
+    bl   = [(sid, s) for sid, s in SCENARIOS.items() if s.category == "baseline"]
 
     avail = sorted(_load_csv_payloads().keys() | _load_saved_payloads().keys())
     missing_payloads = [
@@ -1307,13 +1568,20 @@ def cmd_list() -> None:
         if s.task_data_payload and s.task_data_payload not in avail
     ]
 
-    print("\nScreening Scenarios:")
+    print("\nEligibility Scenarios (Stage 0 — manual REDCap check, auto-restore):")
+    print(f"  {'ID':<10} {'Name':<48} Expected in REDCap")
+    for sid, s in elig:
+        # Pull just the EXPECT ... prefix from notes for a concise summary
+        notes_brief = s.notes.split(" — ")[0] if " — " in s.notes else s.notes[:40]
+        print(f"  {sid:<10} {s.name:<48} {notes_brief}")
+
+    print("\nScreening Fraud Detection Scenarios (Stage 1):")
     print(f"  {'ID':<10} {'Name':<48} Expected")
     for sid, s in scr:
         outcome = " | ".join(f"{k}={v}" for k, v in list(s.expected_fields.items())[:2])
         print(f"  {sid:<10} {s.name:<48} {outcome}")
 
-    print("\nBaseline QC Scenarios:")
+    print("\nBaseline QC Scenarios (Stage 2):")
     print(f"  {'ID':<10} {'Name':<48} Expected")
     for sid, s in bl:
         outcome = " | ".join(f"{k}={v}" for k, v in list(s.expected_fields.items())[:2])

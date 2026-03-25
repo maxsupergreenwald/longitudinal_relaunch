@@ -141,7 +141,22 @@ SHAREPOINT_PAYMENT_UPLOAD_URL = os.getenv(
     "&action=default&mobileredirect=true&DefaultItemOpen=1",
 )
 
-SHAREDDRIVE_NETWORK_PATH = Path(os.getenv("AIM8_SHAREDDRIVE_PATH", "/Volumes/psychedelics/online"))
+# ============================================================================
+# PATH CONFIGURATION — MODIFY HERE TO SWITCH BETWEEN LOCAL AND SHARED DRIVE
+# ============================================================================
+# Default: runs locally against scripts/qc_test_drive/ (no drive mount needed).
+# To use the real shared drive, either:
+#   (a) Set env var at runtime:  export AIM8_SHAREDDRIVE_PATH=/Volumes/psychedelics/online
+#   (b) Comment out the LOCAL line below and uncomment the SHARED DRIVE line.
+
+_SCRIPT_DIR = Path(__file__).parent
+
+### LOCAL (testing — no drive mount needed) ###
+SHAREDDRIVE_NETWORK_PATH = Path(os.getenv("AIM8_SHAREDDRIVE_PATH", str(_SCRIPT_DIR / "qc_test_drive")))
+
+### SHARED DRIVE (production — uncomment and comment out the LOCAL line above) ###
+# SHAREDDRIVE_NETWORK_PATH = Path(os.getenv("AIM8_SHAREDDRIVE_PATH", "/Volumes/psychedelics/online"))
+
 IP_DATABASE_PATH = SHAREDDRIVE_NETWORK_PATH / "ips" / "ips_full.csv"
 FAILED_JSON_PATH = SHAREDDRIVE_NETWORK_PATH / "jsons" / "failed_task_jsons_baseline.csv"
 QC_TODO_PATH = SHAREDDRIVE_NETWORK_PATH / "qc_to_dos"
@@ -212,6 +227,16 @@ BASELINE_DATE_FIELDS = [
     "datedone_answer_checks",
 ]
 
+# ── AI motive auto-fail toggle ────────────────────────────────────────────────
+# When True:  screen_motive AI flags (500-char / template-phrase heuristics)
+#             automatically hard-fail the record before phone review.
+# When False: the record passes to the phone review queue and the researcher
+#             is shown a prominent red warning to check NoGPT manually.
+#             The researcher then decides 'y' / 'n' / '?' as normal.
+# Default: False  (manual review — AI heuristics are noisy enough to warrant
+#                  a human decision rather than automatic rejection)
+AI_MOTIVE_AUTOFAIL: bool = False
+
 
 # ============================================================================
 # SECTION 2: Data Containers
@@ -235,6 +260,10 @@ class ScreeningReview:
     hard_fail           : Records that failed an automatic rule (age, cognition, fake
                           drug, forbidden IP, duplicate email, etc.).  Will receive
                           screening_pass=0 and ineligibile_fraud=1.
+    retroactive_fail    : Historic records (not in the current queue) that share an
+                          email with a record in hard_fail.  Receive the same
+                          screening_pass=0/qc_passed=0/ineligibile_fraud=1 treatment
+                          even though they were not in records_to_screen.
     suspicious_ip       : Records whose IP matches a previously-reviewed / ineligible
                           record.  Will receive ip_zoom_invite=1 for Zoom verification.
     phone_review        : Records that passed all automatic checks and need a human
@@ -254,6 +283,7 @@ class ScreeningReview:
     screen_df: pd.DataFrame
     ip_df: pd.DataFrame
     hard_fail: list[int] = field(default_factory=list)
+    retroactive_fail: list[int] = field(default_factory=list)
     suspicious_ip: list[int] = field(default_factory=list)
     phone_review: list[int] = field(default_factory=list)
     manual_followup: list[int] = field(default_factory=list)
@@ -298,6 +328,15 @@ def ask_yes_no(prompt: str) -> bool:
     return input(prompt).strip().lower() == "yes"
 
 
+def hyperlink(url: str, text: str) -> str:
+    """Return an OSC 8 terminal hyperlink (clickable in VS Code terminal).
+
+    Renders as `text` in the terminal; clicking opens `url` in the browser.
+    Falls back gracefully to 'text (url)' in terminals that don't support OSC 8.
+    """
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
 def clean_email(value: Any) -> str | None:
     """Normalise an email value from a REDCap cell to a lowercase string, or None if blank."""
     if pd.isna(value):
@@ -334,6 +373,40 @@ def string_value(row: pd.Series, field: str) -> str:
     if field not in row.index or pd.isna(row[field]):
         return ""
     return str(row[field]).strip()
+
+
+def _parse_fail_codes(raw: str) -> set[str]:
+    """Parse reviewer reason codes from a free-form string.
+
+    Recognises 'ip', 'phone', and 'ai' in any order and combination,
+    whether space-separated or merged together.
+
+      'ip'        → {'ip'}
+      'ai phone'  → {'ai', 'phone'}
+      'ipai'      → {'ip', 'ai'}
+      'aiip'      → {'ai', 'ip'}
+      'phoneai'   → {'phone', 'ai'}
+      'ip phone ai' → {'ip', 'phone', 'ai'}
+
+    Greedy prefix match within each whitespace-delimited token.
+    Returns an empty set for blank or unrecognised input.
+    """
+    codes: set[str] = set()
+    for token in raw.lower().strip().split():
+        remaining = token
+        while remaining:
+            if remaining.startswith("phone"):
+                codes.add("phone")
+                remaining = remaining[5:]
+            elif remaining.startswith("ip"):
+                codes.add("ip")
+                remaining = remaining[2:]
+            elif remaining.startswith("ai"):
+                codes.add("ai")
+                remaining = remaining[2:]
+            else:
+                break  # unrecognised suffix — stop parsing this token
+    return codes
 
 
 def add_reason(reason_map: dict[int, str], record_id: int, reason: str) -> None:
@@ -416,17 +489,41 @@ def parse_redcap_pdf_log(log_string: str) -> pd.DataFrame:
     Each row contains a record ID and the IP address used to submit the e-Consent.
     Returns a DataFrame with columns ['record_id', 'ip'].
     Raises ValueError if record/IP counts don't align (malformed paste).
+
+    Handles two formats:
+      New (pid=936): filename contains _id{N}_ and IP is concatenated with timestamp
+                     e.g. "pid936_..._id1_2026-03-20_143432.pdf  ...  14:3410.173.118.56"
+      Old (pid=604): record ID precedes a tab+Consent and IP follows a spaced timestamp
+                     e.g. "1\tConsent...  03-20-2026 14:34  10.173.118.56\t1\te-Consent"
     """
-    record_matches = re.findall(r"(\d+)\s*\t(?:Consent|e-Consent)", log_string)
+    # --- Record IDs ---
+    # New format: _id{N}_ embedded in the PDF filename
+    record_matches = re.findall(r"_id(\d+)_\d{4}-\d{2}-\d{2}", log_string)
+    # Old format fallback: standalone number immediately before whitespace + Consent/e-Consent
+    if not record_matches:
+        record_matches = re.findall(r"(\d+)\s+(?:Consent|e-Consent)", log_string)
+
+    # --- IP addresses ---
+    # New format: IP is concatenated directly after HH:MM (no separator), e.g. "14:3410.1.2.3"
+    # \d{2}:\d{2} consumes the minutes; \s* allows an optional space; then captures the IP
     ip_matches = re.findall(
-        r"\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?\s+(\d{1,3}(?:\.\d{1,3}){3})\s*\t1\t\s*e-Consent",
+        r"\d{2}:\d{2}(?::\d{2})?\s*(\d{1,3}(?:\.\d{1,3}){3})",
         log_string,
     )
+    # Old format fallback: IP surrounded by whitespace after the timestamp
+    if not ip_matches:
+        ip_matches = re.findall(
+            r"\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?\s+(\d{1,3}(?:\.\d{1,3}){3})",
+            log_string,
+        )
 
     if not record_matches or not ip_matches or len(record_matches) != len(ip_matches):
         raise ValueError(
             f"Could not align record IDs and IPs in pasted REDCap log "
-            f"(records={len(record_matches)}, ips={len(ip_matches)})."
+            f"(records={len(record_matches)}, ips={len(ip_matches)}).\n"
+            f"  Record IDs found: {record_matches}\n"
+            f"  IPs found:        {ip_matches}\n"
+            "Make sure you copy the full row(s) from the REDCap PDF archive."
         )
 
     pairs = [{"record_id": int(record_id), "ip": ip} for record_id, ip in zip(record_matches, ip_matches)]
@@ -730,10 +827,8 @@ class RelaunchQuickQC:
         Raises RuntimeError listing the unresolved flags and who left them.
         """
         if not base_path.exists():
-            raise RuntimeError(
-                "The shared drive QC folder was not found. Mount "
-                "`/Volumes/psychedelics/online` before running this tool."
-            )
+            base_path.mkdir(parents=True, exist_ok=True)
+            return  # Fresh folder — no prior flags to check.
 
         date_dirs = sorted([path for path in base_path.iterdir() if path.is_dir() and path.name.startswith("2")], reverse=True)
         if not date_dirs:
@@ -798,6 +893,7 @@ class RelaunchQuickQC:
 
         review.phone_review = sorted(set(review.phone_review))
         review.hard_fail = sorted(set(review.hard_fail))
+        review.retroactive_fail = sorted(set(review.retroactive_fail))
         review.suspicious_ip = sorted(set(review.suspicious_ip))
         review.manual_followup = sorted(set(review.manual_followup))
         review.sp_wait = sorted(set(review.sp_wait))
@@ -811,8 +907,22 @@ class RelaunchQuickQC:
         For each record in review.phone_review, prints the phone number, IP address,
         and the participant's full screen_motive answer so the reviewer can read it
         while checking the phone number.  If the screen_motive text triggers any of
-        the AI-generation heuristics (_screen_motive_fraud_reason), a bold red
-        ALL-CAPS warning is printed along with a link to NoGPT for paste-in detection.
+        the AI-generation heuristics (_screen_motive_fraud_reason), a prominent red
+        banner with asterisks is printed listing each flag, a direct link to NoGPT
+        for paste-in AI detection, and the input prompt is prefixed with a red warning
+        so the reviewer knows to check before deciding.
+
+        When the reviewer enters 'y', a follow-up prompt asks for the reason(s):
+          ip    — IP address highly suspicious
+          phone — Phone number suspicious or VOIP
+          ai    — Free text response to screen_motive credibly AI generated
+                  (if an AI flag was already detected, its specific details are appended)
+        Any combination is accepted in any order, with or without spaces
+        (e.g. 'ip', 'aiip', 'phone ai').  The resulting human-readable note is
+        written directly into review.ineligibility_notes, overwriting any
+        pre-existing AI heuristic reason so the reviewer's explicit decision is
+        authoritative.  Leaving blank preserves any existing note or falls back
+        to a generic rejection message.
 
         Asks the researcher to enter one of:
           'y' — fraudulent or VOIP (will hard-fail the record)
@@ -841,21 +951,79 @@ class RelaunchQuickQC:
             motive_display = motive_text if motive_text else "(no response)"
             motive_flag = self._screen_motive_fraud_reason(motive_text)
 
+            phone_digits = "".join(c for c in phone if c.isdigit())
+            ipqs_phone_url = f"https://www.ipqualityscore.com/user/phone-number-validation-api/lookup/number/{phone_digits}"
             print(f"\nRecord {record_id}")
             print(f"  Phone:      {phone}")
+            print(f"              {hyperlink('https://www.spydialer.com', 'SpyDialer')}  |  {hyperlink(ipqs_phone_url, 'IPQuality Score')}")
             print(f"  IP:         {ip_text}")
+            print(f"              {hyperlink(f'https://ipinfo.io/{ip_text}', 'IPInfo')}")
             print(f"  Motivation: {motive_display}")
 
             if motive_flag:
-                print(f"\033[1;31m  *** AI FLAG: {motive_flag.upper()} ***\033[0m")
-                print(f"\033[1;31m  *** CHECK FOR AI-GENERATED TEXT: https://www.nogpt.com ***\033[0m")
+                bar = "*" * 72
+                nogpt_url = "https://www.nogpt.com"
+                print(f"\n\033[1;31m  {bar}\033[0m")
+                print(f"\033[1;31m  *** AI-GENERATED RESPONSE FLAG ***\033[0m")
+                for part in motive_flag.split("; "):
+                    print(f"\033[1;31m  *** {part.upper()} ***\033[0m")
+                print(f"\033[1;31m  ***\033[0m")
+                print(f"\033[1;31m  *** PASTE THE MOTIVATION TEXT INTO NoGPT BEFORE DECIDING:\033[0m")
+                print(f"\033[1;31m  *** {hyperlink(nogpt_url, nogpt_url)}\033[0m")
+                print(f"\033[1;31m  {bar}\033[0m\n")
 
             while True:
-                verdict = input("  Enter 'y' if fraudulent/VOIP, 'n' if clear, '?' if Max should review: ").strip().lower()
-                if verdict in {"y", "n", "?"}:
-                    verdicts[record_id] = verdict
-                    break
-                print("  Please enter only 'y', 'n', or '?'.")
+                if motive_flag:
+                    prompt_text = (
+                        "  \033[1;31m[!!! AI FLAG — check NoGPT first, then decide !!!]\033[0m\n"
+                        "  Enter 'y' fraudulent/VOIP, 'n' clear, '?' Max review: "
+                    )
+                else:
+                    prompt_text = "  Enter 'y' if fraudulent/VOIP, 'n' if clear, '?' if Max should review: "
+                verdict = input(prompt_text).strip().lower()
+                if verdict not in {"y", "n", "?"}:
+                    print("  Please enter only 'y', 'n', or '?'.")
+                    continue
+
+                if verdict == "y":
+                    while True:
+                        raw_reason = input(
+                            "  Reason(s) — any combo of:  ip  phone  ai\n"
+                            "  (e.g. 'ip', 'ai', 'ipai', 'phone ai' — leave blank if other): "
+                        ).strip()
+                        codes = _parse_fail_codes(raw_reason)
+                        reason_parts: list[str] = []
+                        if "ip" in codes:
+                            reason_parts.append("IP address highly suspicious")
+                        if "phone" in codes:
+                            reason_parts.append("Phone number suspicious or VOIP")
+                        if "ai" in codes:
+                            if motive_flag:
+                                reason_parts.append(
+                                    f"Free text response to screen_motive credibly AI generated"
+                                    f" ({motive_flag})"
+                                )
+                            else:
+                                reason_parts.append(
+                                    "Free text response to screen_motive credibly AI generated"
+                                )
+                        if reason_parts:
+                            # Reviewer's explicit choice is authoritative — overwrite any
+                            # pre-existing AI heuristic reason for this record.
+                            review.ineligibility_notes[record_id] = "; ".join(reason_parts)
+                            break
+                        elif raw_reason == "":
+                            # Blank: keep existing note (e.g. AI heuristic) or use generic.
+                            if record_id not in review.ineligibility_notes:
+                                review.ineligibility_notes[record_id] = (
+                                    "Flagged as fraudulent/VOIP by phone review"
+                                )
+                            break
+                        else:
+                            print("  Unrecognised — use 'ip', 'phone', 'ai', or any combo. Leave blank if none apply.")
+
+                verdicts[record_id] = verdict
+                break
 
         return verdicts
 
@@ -882,6 +1050,10 @@ class RelaunchQuickQC:
         updates = self.df.loc[self.df["record_id"].isin(review.records_to_screen)].copy()
         if updates.empty:
             return updates
+        # Cast text columns to object so .loc string assignment doesn't warn
+        for _col in ("ineligibilty_reason", "qc_notes"):
+            if _col in updates.columns:
+                updates[_col] = updates[_col].astype(object)
 
         pass_go = [record_id for record_id, verdict in phone_verdicts.items() if verdict == "n"]
         hard_fail = set(review.hard_fail)
@@ -929,6 +1101,24 @@ class RelaunchQuickQC:
             for record_id, reason in review.ineligibility_notes.items():
                 if record_id in hard_fail:
                     updates.loc[updates["record_id"] == record_id, "qc_notes"] = reason
+
+        # Append hard-fail rows for historic records that share an email with a queued record
+        if review.retroactive_fail:
+            retro_rows = self.df.loc[self.df["record_id"].isin(review.retroactive_fail)].copy()
+            for _col in ("ineligibilty_reason", "qc_notes"):
+                if _col in retro_rows.columns:
+                    retro_rows[_col] = retro_rows[_col].astype(object)
+            retro_rows[["screening_pass", "qc_passed"]] = 0
+            if "ineligibile_fraud" in retro_rows.columns:
+                retro_rows["ineligibile_fraud"] = 1
+            retro_fail_set = set(review.retroactive_fail)
+            for record_id, reason in review.ineligibility_notes.items():
+                if record_id in retro_fail_set:
+                    if "qc_notes" in retro_rows.columns:
+                        retro_rows.loc[retro_rows["record_id"] == record_id, "qc_notes"] = reason
+                    if "ineligibilty_reason" in retro_rows.columns:
+                        retro_rows.loc[retro_rows["record_id"] == record_id, "ineligibilty_reason"] = reason
+            updates = pd.concat([updates, retro_rows], ignore_index=True)
 
         desired_fields = [
             "screening_pass",
@@ -990,18 +1180,28 @@ class RelaunchQuickQC:
         if not missing_records:
             return ip_df
 
+        _redcap_pdf_url = (
+            "https://redcap.research.yale.edu/redcap_v15.5.36/index.php"
+            "?pid=936&route=FileRepositoryController:index&type=pdf_archive"
+        )
         print(
-            f"\n{len(missing_records)} screening records are missing IP metadata.\n"
-            "Paste the PDF archive rows covering those records, or type `no ip` to skip."
+            f"\n{len(missing_records)} screening record(s) are missing IP metadata: {missing_records}\n"
+            f"  {hyperlink(_redcap_pdf_url, 'Open REDCap PDF Archive')}\n"
+            "Copy the rows for those record IDs and paste below, or type `no ip` to skip."
         )
         pasted = input("Paste REDCap PDF archive rows here: ").strip()
         if pasted.lower() == "no ip":
             return ip_df
 
-        new_ip_rows = parse_redcap_pdf_log(pasted)
-        new_ip_rows = new_ip_rows.loc[new_ip_rows["record_id"].isin(missing_records)].copy()
+        parsed_rows = parse_redcap_pdf_log(pasted)
+        new_ip_rows = parsed_rows.loc[parsed_rows["record_id"].isin(missing_records)].copy()
         if new_ip_rows.empty:
-            raise RuntimeError("No usable record/IP pairs were found in the pasted REDCap archive text.")
+            found_ids = sorted(parsed_rows["record_id"].tolist())
+            raise RuntimeError(
+                f"Pasted rows contained record IDs {found_ids} but none match the "
+                f"expected missing records {missing_records}. "
+                "Check that you copied the correct rows from the REDCap PDF archive."
+            )
 
         try:
             import ipinfo
@@ -1042,6 +1242,8 @@ class RelaunchQuickQC:
           - Endorsed kaopectamine (fake drug trap question; kaopectamine_lifetime == '1')
           - Filled in hidden AI prompt injection field (flexibility_yn non-blank)
           - screen_motive looks AI-generated (exactly 500 chars, or 476–524 chars with template phrase)
+            NOTE: behaviour controlled by AI_MOTIVE_AUTOFAIL; when False (default) the record is
+            NOT auto-failed — it goes to phone_review with a prominent warning instead.
           - Completed screening in under 90 seconds (screen_seconds_taken < 90)
 
         SP/atypical washout check (handled separately to support willing-to-wait path):
@@ -1066,7 +1268,7 @@ class RelaunchQuickQC:
                 (numeric_value(row, "english_fluency") < 1, "English fluency not met"),
                 (pd.isna(row.get("geo_crit", np.nan)), "Geographic fraud flag"),
                 # Fake drug trap question checked at screening stage
-                (string_value(row, "kaopectamine_lifetime").strip() == "1", "Endorsed fake drug (kaopectamine) during screening"),
+                (numeric_value(row, "kaopectamine_lifetime") == 1, "Endorsed fake drug (kaopectamine) during screening"),
                 # Hidden AI prompt injection trap: @HIDDEN-SURVEY field that asks the
                 # participant to type 'ok'; normal users never see it, AI agents may fill it
                 (string_value(row, "flexibility_yn").strip() != "", "Responded to hidden AI prompt injection field (flexibility_yn)"),
@@ -1080,8 +1282,8 @@ class RelaunchQuickQC:
                 not pd.isna(numeric_value(row, "sp_dayslastuse"))
                 and numeric_value(row, "sp_dayslastuse") < 42
             )
-            atypical_recent = string_value(row, "atypical_recentuse").strip() == "1"
-            willing_to_wait = string_value(row, "psychedelic_abstinence_yn").strip() == "1"
+            atypical_recent = numeric_value(row, "atypical_recentuse") == 1
+            willing_to_wait = numeric_value(row, "psychedelic_abstinence_yn") == 1
 
             if sp_recent or atypical_recent:
                 if willing_to_wait:
@@ -1100,16 +1302,20 @@ class RelaunchQuickQC:
 
             # screen_motive: flag AI-generated motivational text responses.
             # Per-record reason is built by _screen_motive_fraud_reason (length/phrase heuristics).
+            # Behaviour controlled by AI_MOTIVE_AUTOFAIL at the top of this file.
             motive_reason = self._screen_motive_fraud_reason(string_value(row, "screen_motive").strip())
             if motive_reason:
                 add_reason(review.ineligibility_notes, record_id, motive_reason)
-                review.hard_fail.append(record_id)
+                if AI_MOTIVE_AUTOFAIL:
+                    review.hard_fail.append(record_id)
+                # else: record stays in phone_review; warning shown during collect_phone_verdicts
 
     def _apply_duplicate_identity_checks(self, review: ScreeningReview) -> None:
         """Cross-reference new screening records against historical IPs and emails.
 
-        Builds a set of 'historic' records — anyone who previously screened (whether
-        eligible or not) — then checks each new record for:
+        Builds a set of 'historic' records — anyone who has completed the screening
+        survey (screening_survey_complete=2) or has already been reviewed (qc_passed
+        not null) — then checks each new record for:
 
           1. Forbidden IP org / country: IP is from FORBIDDEN_IP_ORGS or
              FORBIDDEN_IP_COUNTRIES → hard_fail.
@@ -1124,9 +1330,9 @@ class RelaunchQuickQC:
         assert self.df is not None
         df = self.df
 
-        ineligible_mask = df["submit_screen_v3"].isna() & df["datedone_screening_survey"].notna()
         already_reviewed_mask = df["qc_passed"].notna()
-        historic = df.loc[ineligible_mask | already_reviewed_mask].copy()
+        screening_complete_mask = pd.to_numeric(df.get("screening_survey_complete"), errors="coerce") == 2
+        historic = df.loc[already_reviewed_mask | screening_complete_mask].copy()
 
         historic_emails: dict[str, set[int]] = {}
         for _, row in historic.iterrows():
@@ -1164,6 +1370,17 @@ class RelaunchQuickQC:
                 if matching_records:
                     review.hard_fail.append(record_id)
                     add_reason(review.ineligibility_notes, record_id, f"Email duplicates prior record(s): {sorted(matching_records)}")
+                    # Retroactively flag any matching historic records that are still unreviewed
+                    for matched_id in matching_records:
+                        if matched_id in review.records_to_screen:
+                            continue  # already in the queue; will be flagged when its row is processed
+                        matched_rows = df.loc[df["record_id"] == matched_id]
+                        if matched_rows.empty:
+                            continue
+                        mr = matched_rows.iloc[0]
+                        if pd.isna(mr.get("screening_pass")) and pd.isna(mr.get("qc_passed")):
+                            review.retroactive_fail.append(matched_id)
+                            add_reason(review.ineligibility_notes, matched_id, f"Email duplicates record(s) in current review: {sorted({record_id})}")
                     break
 
             if record_id in review.hard_fail:
@@ -1507,7 +1724,7 @@ class RelaunchQuickQC:
         # kaopectamine_lifetime: radio field (1=Yes, 2=No)
         kao_field = "kaopectamine_lifetime"
         if kao_field in df_raw.columns:
-            mask = df_raw[kao_field].astype(str).str.strip() == "1"
+            mask = pd.to_numeric(df_raw[kao_field], errors="coerce") == 1
             failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
 
         # fraud_recent_dose: calc returns 1 when dose report mismatches
@@ -2586,9 +2803,10 @@ def nonempty_task_series(df: pd.DataFrame, primary_field: str, backup_field: str
     Used by _identify_completed_baseline_records() to check whether ACH/VCH/PRL
     data has been submitted before adding a record to the baseline review queue.
     """
-    primary = df[primary_field].apply(lambda value: isinstance(value, str) and value.strip()) if primary_field in df.columns else pd.Series(False, index=df.index)
+    _nonempty = lambda value: bool(isinstance(value, str) and value.strip())
+    primary = df[primary_field].apply(_nonempty) if primary_field in df.columns else pd.Series(False, index=df.index)
     if backup_field and backup_field in df.columns:
-        backup = df[backup_field].apply(lambda value: isinstance(value, str) and value.strip())
+        backup = df[backup_field].apply(_nonempty)
         return primary | backup
     return primary
 

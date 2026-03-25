@@ -285,3 +285,91 @@
 3. Confirm which legacy admin/email fields still exist after the merged XML is imported to REDCap.
 4. Decide whether the repeated-measures script should also write dedicated flag files, or whether the markdown summary is sufficient.
 5. If desired, add a thin notebook launcher that simply shells out to `run_all_qc_relaunch.py` without moving logic back into notebook cells.
+
+---
+
+## Testing Harness Build — 2026-03-24
+
+Added `qc_testing_debug.py` and `qc_relaunch_testing.md` as the official roundtrip testing system for `quickQC_api_calling_v7_relaunch.py`.
+
+### Files added / modified
+- `scripts/qc_testing_debug.py` — new test helper script
+- `scripts/qc_relaunch_testing.md` — new testing guide (all scenarios documented)
+
+### Snapshot persistence (CSV, not JSON)
+- Snapshot files are now CSV + pandas, not JSON.
+  - `qc_test_snapshot_screening.csv` — saved before Stage 1; restored after each ELIG/SCR test
+  - `qc_test_snapshot_baseline.csv` — saved before Stage 2; restored after each BL test
+- `cmd_snapshot`: `project.export_records() → df.to_csv()`
+- `cmd_restore`: `pd.read_csv(dtype=str, keep_default_na=False) → redcap_import_fields()`
+
+### Local shared drive (no mount needed)
+- `SHAREDDRIVE_NETWORK_PATH` now defaults to `scripts/qc_test_drive/` (created by `cmd_setup`).
+- Production line (commented out): `/Volumes/psychedelics/online`
+- `_check_incomplete_flags` auto-creates the folder instead of crashing when the drive is absent.
+
+### Bug fixes in `quickQC_api_calling_v7_relaunch.py`
+- `nonempty_task_series` lambda: wrapped return in `bool()` to prevent mixed str/bool Series that broke the `|` operator.
+- FutureWarning on dtype-incompatible column assignment: cast `ineligibilty_reason` and `qc_notes` columns to `object` before setting string values.
+- `parse_redcap_pdf_log` rewritten to handle both old (tab-delimited) and new (pid=936, `_id{N}_` filename, IP concatenated directly after `HH:MM`) REDCap PDF archive formats.
+
+### Clickable hyperlinks in terminal output
+- Added `hyperlink(url, text)` to `quickQC_api_calling_v7_relaunch.py` using OSC 8 escape sequences — renders as underlined clickable text in VS Code terminal.
+- Used in `collect_phone_verdicts` (SpyDialer, IPQuality Score, IPInfo) and `_load_and_update_ip_database` (REDCap PDF archive link).
+- `_hyperlink()` also added to `qc_testing_debug.py` for the REDCap record link printed in ELIG checklists.
+
+### Rich `cmd_apply` output (`_print_scenario_checklist`)
+- Prints the scenario header, all modifications applied (REDCap fields + IP config + dupe record), expected outcome (key fields, alerts triggered, other fields), prompts to enter during the QC script run, the exact commands to run next, and the NEXT UP scenario.
+- ELIG scenarios show a different block: "WHAT TO CHECK IN REDCAP" with the scenario's `notes`, a clickable REDCap record link, and "Press Enter to auto-restore."
+- SCR/BL scenarios now use `restore baseline` vs `restore screening` dynamically based on `spec.category`.
+
+### IP CSV starts empty
+- `cmd_setup` writes an empty `ips_full.csv` (no placeholder 1.2.3.4 row).
+- Forces the full copy-paste IP flow to be exercised on first test run.
+
+### Stage 0 — Eligibility Scenarios (ELIG-XX)
+- **Key insight:** REDCap's eligibility formula gates `submit_screen_v3`. Participants failing eligibility never reach the QC queue. Eligibility testing is purely manual — the QC script has nothing to check.
+- Added 16 ELIG scenarios (ELIG-00 through ELIG-15) with `category="eligibility"`, `expected_fields={}`, `ip_config=None`, `prompts=[]`.
+  - ELIG-00 to ELIG-09: basic eligibility criteria (age, cognition, seizure, intox, computer, Raven, geo, SP use, English)
+  - ELIG-10 to ELIG-15: SP / salvia / MDMA wait-path scenarios (used within 6 weeks × willing/not willing to wait)
+- `cmd_apply` for ELIG: imports fields → `_print_scenario_checklist` (checklist-only block) → `input("Press Enter…")` → `cmd_restore("screening")`
+- `cmd_verify` for ELIG: prints "manual verification only" and returns early — no field checks.
+- `cmd_list`: new ELIG section (Stage 0) shown before SCR (Stage 1) and BL (Stage 2).
+
+### SCR-XX renumbering
+- Removed SCR-01 through SCR-11 (eligibility criteria that moved to ELIG).
+- Renumbered remaining scenarios:
+
+| New ID | Old ID | Scenario |
+|---|---|---|
+| SCR-00 | SCR-00 | Clean pass (unchanged) |
+| SCR-01 | SCR-11b | SP wait, clean |
+| SCR-02 | SCR-11c | SP wait, VOIP phone |
+| SCR-03 | SCR-11d | MDMA wait, clean |
+| SCR-04 | SCR-12 | Duplicate email |
+| SCR-05 | SCR-13 | Forbidden IP org |
+| SCR-06 | SCR-14 | Forbidden IP country |
+| SCR-07 | SCR-15 | Suspicious duplicate IP |
+| SCR-08 | SCR-16 | Phone verdict: VOIP |
+| SCR-09 | SCR-17 | Phone verdict: manual follow-up |
+| SCR-10 | SCR-18 | Missing IP metadata |
+| SCR-11 | SCR-19 | Kaopectamine trap |
+| SCR-12 | SCR-20 | Flexibility honeypot |
+| SCR-13 | SCR-21 | Screen too fast |
+| SCR-14 | SCR-22 | 500-char motive |
+| SCR-15 | SCR-23 | AI template phrase |
+| SCR-16 | SCR-24 | Both AI flags |
+
+- Fixed `_setup_dupe_record` to use new IDs: `SCR-12` → `SCR-04`, `SCR-15` → `SCR-07`.
+- Fixed `_REDCAP_RECORD_URL` constant placement (was inside `SCENARIOS` dict literal, causing `SyntaxError`; moved outside).
+
+### `qc_relaunch_testing.md` restructure
+- Replaced Overview with a three-stage table (ELIG / SCR / BL).
+- Updated One-Time Setup: removed env var export step (path defaults locally); fixed `.json` → `.csv` snapshot filenames.
+- Updated Standard Test Cycle: added Stage 0 cycle (apply-only, no QC script, no verify, auto-restore); removed `export AIM8_SHAREDDRIVE_PATH` lines from code blocks.
+- Updated Important Notes: added ELIG auto-restore note; updated dupe-record scenario references (SCR-04/07 instead of SCR-12/15).
+- Replaced the entire old Screening Scenarios section with:
+  - Stage 0 (ELIG-00 through ELIG-15): field set + expected REDCap outcome per scenario
+  - "Graduating from Stage 0 to Stage 1" bridge
+  - Stage 1 (SCR-00 through SCR-16): full scenario documentation with new IDs
+- Updated stale IP-scenario reference at bottom of doc (SCR-13/14/15/18 → SCR-05/06/07/10).

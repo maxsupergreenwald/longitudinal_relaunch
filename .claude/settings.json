@@ -13,7 +13,12 @@
       "Read(//Users/msg74/Desktop/powers_lab/psychedelics_dissertation/Aim1_Online_Survey_Tasks/RedCapStuff/Longitudinal_Relaunch/NR>1 {field=$1; label=$5; if \\(field ~ /^\\(psyched_|sp_|validity_|fraud_|psychedelicuse_|psycheduse_\\)/ && label ~ /dose|threshold|light|common|strong|heavy|medium|microdose|times|age.*first|when.*last/i\\) {gsub\\(/\"\"\"\"[^\"\"\"\"]*\"\"\"\"/**)",
       "Bash(sort -t- -k2 -n)",
       "Read(//Users/msg74/.claude/projects/-Users-msg74-Desktop-powers-lab-psychedelics-dissertation-Aim1-Online-Survey-Tasks-RedCapStuff-Longitudinal-Relaunch/.todos/**)",
-      "Read(//Users/msg74/.claude/projects/-Users-msg74-Desktop-powers-lab-psychedelics-dissertation-Aim1-Online-Survey-Tasks-RedCapStuff-Longitudinal-Relaunch/**)"
+      "Read(//Users/msg74/.claude/projects/-Users-msg74-Desktop-powers-lab-psychedelics-dissertation-Aim1-Online-Survey-Tasks-RedCapStuff-Longitudinal-Relaunch/**)",
+      "Bash(xargs cat:*)",
+      "Read(//Users/msg74/Desktop/powers_lab/psychedelics_dissertation/Aim1_Online_Survey_Tasks/RedCapStuff/Longitudinal_Relaunch/**)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   }
 }
