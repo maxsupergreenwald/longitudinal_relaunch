@@ -870,6 +870,38 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     ),
 ),
 
+"SCR-17": ScenarioSpec(
+    "SCR-17", "Fake psychedelic endorsed — Velorine (sp_type_ever option 7)", "screening",
+    "sp_type_ever___7='1' — checked 'Velorine (Vedilia root)', a fabricated drug, in the sp_type_ever "
+    "checkbox. Triggers hard fail before phone verdict.",
+    field_overrides={"sp_type_ever___7": "1"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:Velorine",
+    },
+    expected_fields_dupe={},
+    notes="Hard fail before phone verdict. qc_notes should contain 'Velorine (Vedilia root)'.",
+),
+
+"SCR-18": ScenarioSpec(
+    "SCR-18", "Fake psychedelic endorsed — 24-NO-PET (sp_type_ever option 9)", "screening",
+    "sp_type_ever___9='1' — checked '24-NO-PET (Ergacin)', a fabricated drug, in the sp_type_ever "
+    "checkbox. Triggers hard fail before phone verdict.",
+    field_overrides={"sp_type_ever___9": "1"}, ip_config=IP_CLEAN,
+    task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={
+        "screening_pass": "0", "qc_passed": "0", "ineligibile_fraud": "1",
+        "qc_notes": "CONTAINS:24-NO-PET",
+    },
+    expected_fields_dupe={},
+    notes="Hard fail before phone verdict. qc_notes should contain '24-NO-PET (Ergacin)'.",
+),
+
 # ---------------------------------------------------------------------------
 # BASELINE QC SCENARIOS
 # ---------------------------------------------------------------------------
@@ -1264,6 +1296,54 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         "next_index=4 >= len(replay_fields)=4 -> fourth_fail set instead of another retry slot. "
         "Uses ach_zero as the failing ACH payload."
     ),
+),
+
+"BL-28": ScenarioSpec(
+    "BL-28", "attn_check_etas wrong answer (not 5)", "baseline",
+    "attn_check_etas='3' — absorption-scale attention check requires answer 5 -> failed_trap_questions.",
+    field_overrides={"attn_check_etas": "3"},
+    ip_config=None, task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
+    expected_fields_dupe={},
+    notes="qc_notes contains 'trap/fraud-detection'. Any non-5 answer fires the check.",
+),
+
+"BL-29": ScenarioSpec(
+    "BL-29", "fraud_asi wrong answer (No=2)", "baseline",
+    "fraud_asi='2' — ASI embedded attention check requires Yes (1) -> failed_trap_questions.",
+    field_overrides={"fraud_asi": "2"},
+    ip_config=None, task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
+    expected_fields_dupe={},
+    notes="qc_notes contains 'trap/fraud-detection'. fraud_asi==2 (No) fires the check.",
+),
+
+"BL-30": ScenarioSpec(
+    "BL-30", "alc_age_qc more than 3 off from alc_age", "baseline",
+    "alc_age=18, alc_age_qc=25 (diff=7 > 3) -> failed_drug_age_qc critical fail.",
+    field_overrides={"alc_lifetime": "1", "alc_age": "18", "alc_age_qc": "25"},
+    ip_config=None, task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
+    expected_fields_dupe={},
+    notes="qc_notes contains 'Drug use age inconsistency'. Threshold is >3 years.",
+),
+
+"BL-31": ScenarioSpec(
+    "BL-31", "mj_age_qc more than 3 off from mj_age", "baseline",
+    "mj_age=16, mj_age_qc=24 (diff=8 > 3) -> failed_drug_age_qc critical fail.",
+    field_overrides={"mj_lifetime": "1", "mj_age": "16", "mj_age_qc": "24"},
+    ip_config=None, task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
+    expected_fields_dupe={},
+    notes="qc_notes contains 'Drug use age inconsistency'. Threshold is >3 years.",
 ),
 
 }  # end SCENARIOS

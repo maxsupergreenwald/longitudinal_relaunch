@@ -11,10 +11,10 @@ Three stages of testing:
 | Stage | ID prefix | How it works |
 |---|---|---|
 | 0 — Eligibility | ELIG-00 to ELIG-15 | `apply` imports fields → you check REDCap manually → press Enter → auto-restores |
-| 1 — Screening fraud | SCR-00 to SCR-16 | `apply` → run QC script → `verify` → `restore screening` |
-| 2 — Baseline QC | BL-00 to BL-27+ | `apply` → run QC script → `verify` → `restore baseline` |
+| 1 — Screening fraud | SCR-00 to SCR-18 | `apply` → run QC script → `verify` → `restore screening` |
+| 2 — Baseline QC | BL-00 to BL-31 | `apply` → run QC script → `verify` → `restore baseline` |
 
-**Total: 16 ELIG + 17 SCR + ~30 BL scenarios.**
+**Total: 16 ELIG + 19 SCR + 32 BL scenarios.**
 
 ---
 
@@ -830,6 +830,56 @@ Sets `screen_motive` to `"I would describe my personal motivation" + "x" * 462` 
 **Reset:** `python3 qc_testing_debug.py restore screening`
 
 **Notes:** Both semicolon-joined reasons should appear in a single `qc_notes` string. Confirm the output reads like: `"screen_motive: response is exactly 500 characters; screen_motive: response is 500 chars and begins with AI template phrase"`.
+
+---
+
+### SCR-17 — Fake Psychedelic Endorsed: Velorine (sp_type_ever option 7)
+
+**What it tests:** Participant checked option 7 ("Velorine / Vedilia root") in the `sp_type_ever` checkbox — a fabricated drug. `_apply_screening_eligibility_rules` fires `sp_type_ever___7 == 1` → hard fail.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-17
+```
+Sets `sp_type_ever___7='1'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "Velorine") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-17`
+**Reset:** `python3 qc_testing_debug.py restore screening`
+
+---
+
+### SCR-18 — Fake Psychedelic Endorsed: 24-NO-PET (sp_type_ever option 9)
+
+**What it tests:** Participant checked option 9 ("24-NO-PET / Ergacin") in the `sp_type_ever` checkbox — also fabricated. `_apply_screening_eligibility_rules` fires `sp_type_ever___9 == 1` → hard fail.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply SCR-18
+```
+Sets `sp_type_ever___9='1'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `screening_pass` | 0 |
+| `qc_passed` | 0 |
+| `ineligibile_fraud` | 1 |
+| `qc_notes` | (contains "24-NO-PET") |
+
+**Verify:** `python3 qc_testing_debug.py verify SCR-18`
+**Reset:** `python3 qc_testing_debug.py restore screening`
 
 ---
 
@@ -1668,6 +1718,100 @@ Sets `verify_emailed=1` and `sp_verify_pass=1` on record_id=1. All other fields 
 **Reset:** `python3 qc_testing_debug.py restore`
 
 **Notes:** Confirm in the console output that NO verification email note appears. An expense sheet should appear in `qc_test_drive/qc_to_dos/`. This test closes the loop on BL-10 (twice-inconsistent fail) and BL-11–15 (first-time verify path).
+
+---
+
+### BL-28 — attn_check_etas Wrong Answer (not 5)
+
+**What it tests:** `attn_check_etas='3'` — the absorption-scale attention check requires answer 5. Any other answered value triggers `_find_trap_question_failures` → `failed_trap_questions` → `qc_passed=0`.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-28
+```
+Sets `attn_check_etas='3'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 0 |
+| `qc_notes` | (contains "trap/fraud-detection") |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-28`
+**Reset:** `python3 qc_testing_debug.py restore baseline`
+
+---
+
+### BL-29 — fraud_asi Wrong Answer (No=2)
+
+**What it tests:** `fraud_asi='2'` — the ASI embedded attention check requires Yes (1). Answering No (2) triggers `_find_trap_question_failures` → `failed_trap_questions` → `qc_passed=0`.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-29
+```
+Sets `fraud_asi='2'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 0 |
+| `qc_notes` | (contains "trap/fraud-detection") |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-29`
+**Reset:** `python3 qc_testing_debug.py restore baseline`
+
+---
+
+### BL-30 — alc_age_qc More Than 3 Off from alc_age
+
+**What it tests:** `alc_age=18`, `alc_age_qc=25` (diff=7 > 3). `_find_drug_age_mismatch` detects the discrepancy → `failed_drug_age_qc` → `qc_passed=0`. Checks that the re-confirmed alcohol first-use age matches what was reported in the substance-use survey.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-30
+```
+Sets `alc_lifetime='1'`, `alc_age='18'`, `alc_age_qc='25'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 0 |
+| `qc_notes` | (contains "Drug use age inconsistency") |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-30`
+**Reset:** `python3 qc_testing_debug.py restore baseline`
+
+**Notes:** Threshold is strictly >3 years. A diff of exactly 3 should NOT trigger the flag.
+
+---
+
+### BL-31 — mj_age_qc More Than 3 Off from mj_age
+
+**What it tests:** `mj_age=16`, `mj_age_qc=24` (diff=8 > 3). Same mechanism as BL-30 but for cannabis first-use age.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-31
+```
+Sets `mj_lifetime='1'`, `mj_age='16'`, `mj_age_qc='24'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 0 |
+| `qc_notes` | (contains "Drug use age inconsistency") |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-31`
+**Reset:** `python3 qc_testing_debug.py restore baseline`
 
 ---
 

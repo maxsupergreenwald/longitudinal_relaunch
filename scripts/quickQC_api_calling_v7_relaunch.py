@@ -25,7 +25,7 @@ This script handles two distinct review queues that arise during daily data coll
      - Runs task-level QC on ACH, VCH, and PRL data (slope, zero-detection,
        first-15-trial, copy-paste duplicate checks)
      - Checks attention checks, race/age consistency, and trap/fraud questions
-       (kaopectamine, fraud_caps, fraud_pdi)
+       (kaopectamine, fraud_caps, fraud_pdi, attn_check_etas, fraud_asi)
      - Evaluates SP use responses for internal consistency (illogical counts,
        wrong most-recent type, implausible routes of administration)
      - Routes failed-task records into replay slots (up to 4 per task) rather than
@@ -1241,6 +1241,8 @@ class RelaunchQuickQC:
           - Geographic fraud flag (geo_crit is NaN)
           - Endorsed kaopectamine (fake drug trap question; kaopectamine_lifetime == '1')
           - Filled in hidden AI prompt injection field (flexibility_yn non-blank)
+          - Endorsed fake psychedelic option 7 (Velorine / Vedilia root) in sp_type_ever checkbox
+          - Endorsed fake psychedelic option 9 (24-NO-PET / Ergacin) in sp_type_ever checkbox
           - screen_motive looks AI-generated (exactly 500 chars, or 476–524 chars with template phrase)
             NOTE: behaviour controlled by AI_MOTIVE_AUTOFAIL; when False (default) the record is
             NOT auto-failed — it goes to phone_review with a prominent warning instead.
@@ -1272,6 +1274,11 @@ class RelaunchQuickQC:
                 # Hidden AI prompt injection trap: @HIDDEN-SURVEY field that asks the
                 # participant to type 'ok'; normal users never see it, AI agents may fill it
                 (string_value(row, "flexibility_yn").strip() != "", "Responded to hidden AI prompt injection field (flexibility_yn)"),
+                # Fake psychedelic trap questions in the sp_type_ever checkbox.
+                # Options 7 (Velorine / Vedilia root) and 9 (24-NO-PET / Ergacin) are fabricated.
+                # REDCap exports each checkbox option as a separate column: sp_type_ever___N = '1' if checked.
+                (numeric_value(row, "sp_type_ever___7") == 1, "Endorsed fake psychedelic 'Velorine (Vedilia root)' (sp_type_ever option 7)"),
+                (numeric_value(row, "sp_type_ever___9") == 1, "Endorsed fake psychedelic '24-NO-PET (Ergacin)' (sp_type_ever option 9)"),
                 # Speed check: under 90 seconds is too fast for a human to read and answer
                 (0 < numeric_value(row, "screen_seconds_taken") < 90, "Completed screening suspiciously fast (screen_seconds_taken < 90s)"),
             ]
@@ -1494,6 +1501,7 @@ class RelaunchQuickQC:
         # --------------------------------------------
         failed_attn_check = self._find_failed_attention_checks(df_raw)
         failed_new_qc = self._find_race_age_mismatch(df_raw)
+        failed_drug_age_qc = self._find_drug_age_mismatch(df_raw)
         failed_trap_questions = self._find_trap_question_failures(df_raw)
         sp_findings = self._evaluate_absurd_sp_responses(df_raw)
         no_sms_verification = df_raw.loc[df_raw["phone_verified"].isna(), "record_id"].tolist()
@@ -1521,6 +1529,7 @@ class RelaunchQuickQC:
         qc_lists = {
             "failedAttnCheck": to_int_list(failed_attn_check),
             "failed_new_qc": to_int_list(failed_new_qc),
+            "failed_drug_age_qc": to_int_list(failed_drug_age_qc),
             "failed_trap_questions": to_int_list(failed_trap_questions),
             "failed_sp_qc": to_int_list(sp_findings["failed_sp_qc"]),
             "failed_usetime_qc": to_int_list(sp_findings["failed_usetime_qc"]),
@@ -1716,6 +1725,8 @@ class RelaunchQuickQC:
         - fraud_caps == '0'                  (missed embedded CAPS attention check — correct answer is Yes/1)
         - fraud_pdi == '0'                   (missed embedded PDI attention check — correct answer is Yes/1)
         - ai_copy_paste == '1' or '3'        (disagreed with no-copy-paste policy, or self-declared as AI)
+        - attn_check_etas != 5               (absorption scale attention check — correct answer is 5)
+        - fraud_asi != 1                     (ASI embedded attention check — correct answer is 1/Yes)
         A record is flagged if any single check fires.
         """
         failures: set[int] = set()
@@ -1740,6 +1751,17 @@ class RelaunchQuickQC:
         # 1 = disagrees with no-copy-paste policy; 3 = self-declared AI agent.
         if "ai_copy_paste" in df_raw.columns:
             mask = df_raw["ai_copy_paste"].astype(str).str.strip().isin(["1", "3"])
+            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+
+        # attn_check_etas: radio 1–5; correct answer is 5.  Only flag answered records.
+        if "attn_check_etas" in df_raw.columns:
+            answered = df_raw["attn_check_etas"].notna() & (df_raw["attn_check_etas"].astype(str).str.strip() != "")
+            mask = pd.to_numeric(df_raw["attn_check_etas"], errors="coerce") != 5
+            failures.update(df_raw.loc[answered & mask, "record_id"].astype(int).tolist())
+
+        # fraud_asi: radio 1=Yes (correct), 2=No; flag if answered No (2).
+        if "fraud_asi" in df_raw.columns:
+            mask = pd.to_numeric(df_raw["fraud_asi"], errors="coerce") == 2
             failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
 
         return [int(r) for r in sorted(failures)]
@@ -1769,6 +1791,30 @@ class RelaunchQuickQC:
             if ((racediff > 0) and (agediff > 0)) or (racediff > 1) or (agediff > 1):
                 failures.append(int(row["record_id"]))
         return failures
+
+    def _find_drug_age_mismatch(self, df_raw: pd.DataFrame) -> list[int]:
+        """Return record IDs where alc_age_qc or mj_age_qc differs from the screening value by >3 years.
+
+        Participants report age of first alcohol use (alc_age) and cannabis use (mj_age) during
+        the main substance-use survey, then re-confirm each in the validity_checks instrument
+        (alc_age_qc, mj_age_qc).  A discrepancy of more than 3 years suggests the baseline was
+        completed by a different person, or that one answer was fabricated.
+
+        A record is flagged if |alc_age - alc_age_qc| > 3 OR |mj_age - mj_age_qc| > 3.
+        Pairs where either value is blank (i.e., the participant doesn't use that substance)
+        are skipped silently.
+        """
+        pairs = [("alc_age", "alc_age_qc"), ("mj_age", "mj_age_qc")]
+        flagged: set[int] = set()
+        for orig_field, qc_field in pairs:
+            if orig_field not in df_raw.columns or qc_field not in df_raw.columns:
+                continue
+            orig_num = pd.to_numeric(df_raw[orig_field], errors="coerce")
+            qc_num   = pd.to_numeric(df_raw[qc_field],   errors="coerce")
+            both_present = orig_num.notna() & qc_num.notna()
+            mask = both_present & ((orig_num - qc_num).abs() > 3)
+            flagged.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+        return sorted(flagged)
 
     def _evaluate_absurd_sp_responses(self, df_raw: pd.DataFrame) -> dict[str, Any]:
         """Evaluate the internal consistency and plausibility of SP use self-reports.
@@ -2459,6 +2505,7 @@ class RelaunchQuickQC:
         note_map = {
             "failedAttnCheck": "Failed attention check",
             "failed_new_qc": "Failed race/age consistency QC",
+            "failed_drug_age_qc": "Drug use age inconsistency (alc_age or mj_age re-confirmed value differs by >3 years)",
             "failed_trap_questions": "Failed trap/fraud-detection questions (fake drug, dose mismatch, AI copy-paste, or missed attention check)",
             "fraud_copy_paste_ach": "Copy pasted ACH data",
             "fraud_copy_paste_vch": "Copy pasted VCH data",
