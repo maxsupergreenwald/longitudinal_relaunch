@@ -1346,6 +1346,38 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     notes="qc_notes contains 'Drug use age inconsistency'. Threshold is >3 years.",
 ),
 
+"BL-32": ScenarioSpec(
+    "BL-32", "alc lifetime uses < alc 6-month uses", "baseline",
+    "alc_life_n=10, alc_6mo_n=20 -> alc_life_uses(10) < alc_6month(20) -> failed_drug_life_uses_qc critical fail.",
+    field_overrides={
+        "alc_lifetime": "1",
+        "alc_life_freq_pref": "1", "alc_life_n": "10",
+        "alc_6month_yn": "1", "alc_6mo_freq_pref": "1", "alc_6mo_n": "20",
+    },
+    ip_config=None, task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
+    expected_fields_dupe={},
+    notes="qc_notes contains 'Drug use lifetime/6-month inconsistency' with alc detail. REDCap must compute alc_life_uses and alc_6month calc fields from the set source fields.",
+),
+
+"BL-33": ScenarioSpec(
+    "BL-33", "mj lifetime uses < mj 6-month uses", "baseline",
+    "mj_life_n=5, mj_6mo_n=15 -> mj_life_uses(5) < mj_6month(15) -> failed_drug_life_uses_qc critical fail.",
+    field_overrides={
+        "mj_lifetime": "1",
+        "mj_life_freq_pref": "1", "mj_life_n": "5",
+        "mj_6month_yn": "1", "mj_6mo_freq_pref": "1", "mj_6mo_n": "15",
+    },
+    ip_config=None, task_data_payload=None, task_data_field=None,
+    uses_dupe_record=False, dupe_task_field=None,
+    prompts=["User code: m", "Import: yes"],
+    expected_fields={"qc_passed": "0", "qc_notes": "NOT_EMPTY"},
+    expected_fields_dupe={},
+    notes="qc_notes contains 'Drug use lifetime/6-month inconsistency' with mj detail. REDCap must compute mj_life_uses and mj_6month calc fields from the set source fields.",
+),
+
 }  # end SCENARIOS
 
 

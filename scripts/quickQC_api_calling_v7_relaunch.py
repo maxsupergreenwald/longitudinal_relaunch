@@ -316,6 +316,24 @@ class CompletionReview:
     expensesheet_path: Path | None
     failed_json_append_count: int
     qc_lists: dict[str, list[int]]
+    failure_summaries: dict[int, str]  # record_id → formatted field=value + reason string
+
+
+# Fields to display alongside the failure reason for each qc_lists category.
+# Only non-null values are shown; order determines display order.
+_FAILURE_FIELD_MAP: dict[str, list[str]] = {
+    "failedAttnCheck":          ["attn_check_surveybl", "attn_check_surveybl2", "attn_check_surveybl3"],
+    "failed_new_qc":            ["race_v2", "race_qc", "age_v2", "age_qc"],
+    "failed_drug_age_qc":       ["alc_age", "alc_age_qc", "mj_age", "mj_age_qc"],
+    "failed_drug_life_uses_qc": [],   # detail already embedded in the reason string
+    "failed_trap_questions":    ["kaopectamine_lifetime", "fraud_caps", "fraud_pdi",
+                                 "ai_copy_paste", "attn_check_etas", "fraud_asi"],
+    "fraud_copy_paste_ach":     [],
+    "fraud_copy_paste_vch":     [],
+    "fraud_copy_paste_prl":     [],
+    "failed_sp_qc":             ["psycheduse_life_nomic", "psychedelicuse_lifetimetot",
+                                 "sp_dayslastuse", "psycheduse_6month_nomic"],
+}
 
 
 # ============================================================================
@@ -1470,6 +1488,7 @@ class RelaunchQuickQC:
                 expensesheet_path=None,
                 failed_json_append_count=0,
                 qc_lists={},
+                failure_summaries={},
             )
 
         df_raw = self.df.loc[self.df["record_id"].isin(records)].copy().reset_index(drop=True)
@@ -1499,10 +1518,11 @@ class RelaunchQuickQC:
         # --------------------------------------------
         # Baseline questionnaire / answer consistency
         # --------------------------------------------
-        failed_attn_check = self._find_failed_attention_checks(df_raw)
+        failed_attn_check, attn_check_reasons = self._find_failed_attention_checks(df_raw)
         failed_new_qc = self._find_race_age_mismatch(df_raw)
         failed_drug_age_qc = self._find_drug_age_mismatch(df_raw)
-        failed_trap_questions = self._find_trap_question_failures(df_raw)
+        failed_drug_life_uses_qc, drug_life_lt_sixmo_reasons = self._find_drug_life_lt_sixmo(df_raw)
+        failed_trap_questions, trap_question_reasons = self._find_trap_question_failures(df_raw)
         sp_findings = self._evaluate_absurd_sp_responses(df_raw)
         no_sms_verification = df_raw.loc[df_raw["phone_verified"].isna(), "record_id"].tolist()
         no_main_survey = df_raw.loc[df_raw["si_2_v2"].isna(), "record_id"].tolist()
@@ -1530,10 +1550,10 @@ class RelaunchQuickQC:
             "failedAttnCheck": to_int_list(failed_attn_check),
             "failed_new_qc": to_int_list(failed_new_qc),
             "failed_drug_age_qc": to_int_list(failed_drug_age_qc),
+            "failed_drug_life_uses_qc": to_int_list(failed_drug_life_uses_qc),
             "failed_trap_questions": to_int_list(failed_trap_questions),
             "failed_sp_qc": to_int_list(sp_findings["failed_sp_qc"]),
             "failed_usetime_qc": to_int_list(sp_findings["failed_usetime_qc"]),
-            "illogical_year": to_int_list(sp_findings["illogical_year"]),
             "illogical_life": to_int_list(sp_findings["illogical_life"]),
             "wrong_recent": to_int_list(sp_findings["wrong_recent"]),
             "nanresponses": to_int_list(sp_findings["nanresponses"]),
@@ -1564,6 +1584,7 @@ class RelaunchQuickQC:
         failed_json_append_count = 0
         failed_json_rows: list[dict[str, Any]] = []
         absurdity_reasons = sp_findings["absurdity_reasons"]
+        failure_summaries: dict[int, str] = {}
 
         for record_id in records:
             row = self.df.loc[self.df["record_id"] == record_id].reset_index(drop=True)
@@ -1572,10 +1593,23 @@ class RelaunchQuickQC:
             current = row.iloc[0]
             record_updates: dict[str, Any] = {}
 
-            critical_note = self._critical_failure_note(record_id, qc_lists, absurdity_reasons)
+            critical_note = self._critical_failure_note(record_id, qc_lists, absurdity_reasons, drug_life_lt_sixmo_reasons, attn_check_reasons, trap_question_reasons)
             if critical_note:
                 record_updates["qc_passed"] = 0
                 record_updates["qc_notes"] = critical_note
+                # Build field snapshot for interactive failure display
+                triggered_key = next(
+                    (k for k, ids in qc_lists.items() if record_id in ids and k in _FAILURE_FIELD_MAP),
+                    None,
+                )
+                field_parts: list[str] = []
+                for field in _FAILURE_FIELD_MAP.get(triggered_key or "", []):
+                    if field in current.index:
+                        val = current[field]
+                        if pd.notna(val) and str(val).strip() not in ("", "nan"):
+                            field_parts.append(f"{field}={val}")
+                fields_str = ("  Fields: " + ", ".join(field_parts)) if field_parts else ""
+                failure_summaries[record_id] = f"  Check:  {critical_note}\n{fields_str}" if fields_str else f"  Check:  {critical_note}"
                 if critical_note.startswith("Absurd psychedelics responses") and "fraudulent_email_inconsistentanswers" in update_df.columns:
                     record_updates["fraudulent_email_inconsistentanswers"] = 1
                 elif "fraudulent_email" in update_df.columns and "copy pasted" in critical_note.lower():
@@ -1643,6 +1677,7 @@ class RelaunchQuickQC:
             expensesheet_path=expensesheet_path,
             failed_json_append_count=failed_json_count,
             qc_lists=qc_lists,
+            failure_summaries=failure_summaries,
         )
 
     def import_completion_updates(self, review: CompletionReview) -> None:
@@ -1675,21 +1710,35 @@ class RelaunchQuickQC:
     # SECTION 5D: Baseline fraud / absurd-SP logic
     # ------------------------------------------------------------------
 
-    def _find_failed_attention_checks(self, df_raw: pd.DataFrame) -> list[int]:
+    def _find_failed_attention_checks(
+        self, df_raw: pd.DataFrame
+    ) -> tuple[list[int], dict[int, str]]:
         """Return record IDs that failed one or more embedded attention checks.
 
         Checks attn_check_surveybl, attn_check_surveybl2, and attn_check_surveybl3.
         Each is a yesno field where the correct answer is 1 (Yes).  A record fails
-        if the sum of existing checks is less than the number of existing check fields
-        (i.e., they got at least one wrong).  Only checks fields present in the export
+        if it answered No (0) on any check.  Only checks fields present in the export
         to handle cases where a field does not yet exist in REDCap.
+
+        Returns:
+            flagged : sorted list of record IDs with at least one failed check
+            reasons : dict mapping record_id → which specific check(s) were failed
         """
-        attn_fields = ["attn_check_surveybl", "attn_check_surveybl2", "attn_check_surveybl3"]
-        existing = [field for field in attn_fields if field in df_raw.columns]
-        if not existing:
-            return []
-        totals = df_raw[existing].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-        return to_int_list(df_raw.loc[totals < len(existing), "record_id"].tolist())
+        labels = {
+            "attn_check_surveybl":  "attn_check_surveybl (baseline survey attention check 1, correct=Yes)",
+            "attn_check_surveybl2": "attn_check_surveybl2 (baseline survey attention check 2, correct=Yes)",
+            "attn_check_surveybl3": "attn_check_surveybl3 (baseline survey attention check 3, correct=Yes)",
+        }
+        flagged: set[int] = set()
+        reasons: dict[int, str] = {}
+        for field, label in labels.items():
+            if field not in df_raw.columns:
+                continue
+            mask = df_raw[field].astype(str).str.strip() == "0"
+            for rid in df_raw.loc[mask, "record_id"].astype(int).tolist():
+                flagged.add(rid)
+                reasons[rid] = f"{reasons[rid]}; {label}" if rid in reasons else label
+        return sorted(flagged), reasons
 
     def _screen_motive_fraud_reason(self, text: str) -> str | None:
         """Return a fraud reason if screen_motive looks AI-generated, else None.
@@ -1730,41 +1779,58 @@ class RelaunchQuickQC:
         A record is flagged if any single check fires.
         """
         failures: set[int] = set()
+        reasons: dict[int, str] = {}
+
+        def _flag(rids: list[int], label: str) -> None:
+            for rid in rids:
+                failures.add(rid)
+                reasons[rid] = f"{reasons[rid]}; {label}" if rid in reasons else label
 
         # kaopectamine_lifetime: radio field (1=Yes, 2=No)
         kao_field = "kaopectamine_lifetime"
         if kao_field in df_raw.columns:
             mask = pd.to_numeric(df_raw[kao_field], errors="coerce") == 1
-            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+            _flag(df_raw.loc[mask, "record_id"].astype(int).tolist(),
+                  "endorsed fake drug kaopectamine")
 
         # fraud_caps: yesno — correct answer is Yes (1); flag if answered No (0)
         if "fraud_caps" in df_raw.columns:
             mask = df_raw["fraud_caps"].astype(str).str.strip() == "0"
-            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+            _flag(df_raw.loc[mask, "record_id"].astype(int).tolist(),
+                  "failed CAPS attention check (correct=Yes)")
 
         # fraud_pdi: yesno — correct answer is Yes (1); flag if answered No (0)
         if "fraud_pdi" in df_raw.columns:
             mask = df_raw["fraud_pdi"].astype(str).str.strip() == "0"
-            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+            _flag(df_raw.loc[mask, "record_id"].astype(int).tolist(),
+                  "failed PDI attention check (correct=Yes)")
 
         # ai_copy_paste: radio — 2 (I agree) is the only valid response.
         # 1 = disagrees with no-copy-paste policy; 3 = self-declared AI agent.
         if "ai_copy_paste" in df_raw.columns:
-            mask = df_raw["ai_copy_paste"].astype(str).str.strip().isin(["1", "3"])
-            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+            sub = df_raw[df_raw["ai_copy_paste"].astype(str).str.strip().isin(["1", "3"])]
+            for _, row in sub.iterrows():
+                val = str(row["ai_copy_paste"]).strip()
+                label = ("disagreed with no-copy-paste policy (ai_copy_paste=1)"
+                         if val == "1" else "self-declared AI agent (ai_copy_paste=3)")
+                _flag([int(row["record_id"])], label)
 
         # attn_check_etas: radio 1–5; correct answer is 5.  Only flag answered records.
         if "attn_check_etas" in df_raw.columns:
             answered = df_raw["attn_check_etas"].notna() & (df_raw["attn_check_etas"].astype(str).str.strip() != "")
-            mask = pd.to_numeric(df_raw["attn_check_etas"], errors="coerce") != 5
-            failures.update(df_raw.loc[answered & mask, "record_id"].astype(int).tolist())
+            sub = df_raw[answered & (pd.to_numeric(df_raw["attn_check_etas"], errors="coerce") != 5)]
+            for _, row in sub.iterrows():
+                got = str(int(pd.to_numeric(row["attn_check_etas"], errors="coerce")))
+                _flag([int(row["record_id"])],
+                      f"failed absorption-scale attention check attn_check_etas (correct=5, got={got})")
 
         # fraud_asi: radio 1=Yes (correct), 2=No; flag if answered No (2).
         if "fraud_asi" in df_raw.columns:
             mask = pd.to_numeric(df_raw["fraud_asi"], errors="coerce") == 2
-            failures.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
+            _flag(df_raw.loc[mask, "record_id"].astype(int).tolist(),
+                  "failed ASI attention check fraud_asi (correct=Yes)")
 
-        return [int(r) for r in sorted(failures)]
+        return [int(r) for r in sorted(failures)], reasons
 
     def _find_race_age_mismatch(self, df_raw: pd.DataFrame) -> list[int]:
         """Return record IDs where the race or age answer changed between screening and baseline.
@@ -1816,6 +1882,51 @@ class RelaunchQuickQC:
             flagged.update(df_raw.loc[mask, "record_id"].astype(int).tolist())
         return sorted(flagged)
 
+    def _find_drug_life_lt_sixmo(
+        self, df_raw: pd.DataFrame
+    ) -> tuple[list[int], dict[int, str]]:
+        """Return records where any drug's lifetime use count is less than its 6-month count.
+
+        For each of the 14 substance-use drugs, compares {drug}_life_uses (the new
+        REDCap calc field: direct count or frequency × years-using) against {drug}_6month.
+        A participant's 6-month use cannot exceed their lifetime use — if it does, either
+        answer was fabricated or the participant didn't understand the question.
+
+        Both fields must be non-NaN for a pair to be evaluated; blank means the participant
+        doesn't use that substance, so those pairs are skipped silently.
+
+        Returns:
+            flagged   : sorted list of record IDs with at least one drug violation
+            reasons   : dict mapping record_id → human-readable summary of which drug(s)
+                        triggered the flag (written to qc_notes on failure)
+        """
+        drugs = [
+            "alc", "mj", "coke", "opioids", "pcp", "amph", "mdma",
+            "ghb", "inhalants", "ibogaine", "salvia", "scopolamine", "dxm", "other",
+        ]
+        flagged: set[int] = set()
+        reasons: dict[int, str] = {}
+        for drug in drugs:
+            life_field = f"{drug}_life_uses"
+            sixmo_field = f"{drug}_6month"
+            if life_field not in df_raw.columns or sixmo_field not in df_raw.columns:
+                continue
+            life_num  = pd.to_numeric(df_raw[life_field],  errors="coerce")
+            sixmo_num = pd.to_numeric(df_raw[sixmo_field], errors="coerce")
+            both_present = life_num.notna() & sixmo_num.notna()
+            mask = both_present & (life_num < sixmo_num)
+            for rid in df_raw.loc[mask, "record_id"].astype(int).tolist():
+                flagged.add(rid)
+                detail = (
+                    f"{drug}: lifetime={int(life_num[df_raw['record_id']==rid].iloc[0])} "
+                    f"< 6-month={int(sixmo_num[df_raw['record_id']==rid].iloc[0])}"
+                )
+                if rid in reasons:
+                    reasons[rid] += f"; {detail}"
+                else:
+                    reasons[rid] = detail
+        return sorted(flagged), reasons
+
     def _evaluate_absurd_sp_responses(self, df_raw: pd.DataFrame) -> dict[str, Any]:
         """Evaluate the internal consistency and plausibility of SP use self-reports.
 
@@ -1838,10 +1949,9 @@ class RelaunchQuickQC:
 
         Checks leading to 'failed_usetime_qc' (verification needed, not auto-fail):
           - sp_dayslastuse < 180 but psycheduse_6month_nomic < 1 (or vice versa)
-          - sp_dayslastuse < 365 but psycheduse_year_nomic < 1 (or vice versa)
 
-        Checks leading to 'illogical_year' / 'illogical_life' (verification needed):
-          - Year count > lifetime count, or year count > lifetime count
+        Checks leading to 'illogical_life' (verification needed):
+          - 6-month count > lifetime count
 
         Checks leading to 'wrong_recent' (verification needed):
           - sp_type_recent (screening) != sp_type_recent_qc (baseline survey)
@@ -1852,7 +1962,6 @@ class RelaunchQuickQC:
         findings = {
             "failed_sp_qc": [],
             "failed_usetime_qc": [],
-            "illogical_year": [],
             "illogical_life": [],
             "wrong_recent": [],
             "nanresponses": [],
@@ -1918,14 +2027,7 @@ class RelaunchQuickQC:
                     findings["failed_sp_qc"].append(record_id)
                     findings["absurdity_reasons"][record_id] = "Reported a bizarre route of administration for SPs"
 
-                if numeric_value(row, "psycheduse_year_nomic") < numeric_value(row, "psycheduse_6month_nomic"):
-                    findings["illogical_year"].append(record_id)
-                    findings["absurdity_reasons"][record_id] = "Has illogical answers for SP use in the past year"
-
-                if (
-                    numeric_value(row, "psycheduse_life_nomic") < numeric_value(row, "psycheduse_6month_nomic")
-                    or numeric_value(row, "psycheduse_life_nomic") < numeric_value(row, "psycheduse_year_nomic")
-                ):
+                if numeric_value(row, "psycheduse_life_nomic") < numeric_value(row, "psycheduse_6month_nomic"):
                     findings["illogical_life"].append(record_id)
                     findings["absurdity_reasons"][record_id] = "Has illogical answers for SP use in their lifetime"
 
@@ -1935,12 +2037,6 @@ class RelaunchQuickQC:
                 ):
                     findings["failed_usetime_qc"].append(record_id)
                     findings["absurdity_reasons"][record_id] = "Has inconsistent answers for SP use in the past 6 months"
-                elif (
-                    (numeric_value(row, "sp_dayslastuse") < 365 and numeric_value(row, "psycheduse_year_nomic") < 1)
-                    or (numeric_value(row, "sp_dayslastuse") > 365 and numeric_value(row, "psycheduse_year_nomic") > 0)
-                ):
-                    findings["failed_usetime_qc"].append(record_id)
-                    findings["absurdity_reasons"][record_id] = "Has inconsistent answers for SP use in the past year"
 
                 # Age-of-first-use vs current age: impossible if agefirst > age_v2
                 _dose_labels = [
@@ -2494,6 +2590,9 @@ class RelaunchQuickQC:
         record_id: int,
         qc_lists: dict[str, list[int]],
         absurdity_reasons: dict[int, str],
+        drug_life_lt_sixmo_reasons: dict[int, str],
+        attn_check_reasons: dict[int, str],
+        trap_question_reasons: dict[int, str],
     ) -> str | None:
         """Return a failure reason string if this record should be hard-failed at baseline.
 
@@ -2502,20 +2601,21 @@ class RelaunchQuickQC:
         Returns the first matching reason string, or None if no critical failure found.
         The returned string is written to qc_notes and qc_passed is set to 0.
         """
-        note_map = {
-            "failedAttnCheck": "Failed attention check",
-            "failed_new_qc": "Failed race/age consistency QC",
-            "failed_drug_age_qc": "Drug use age inconsistency (alc_age or mj_age re-confirmed value differs by >3 years)",
-            "failed_trap_questions": "Failed trap/fraud-detection questions (fake drug, dose mismatch, AI copy-paste, or missed attention check)",
-            "fraud_copy_paste_ach": "Copy pasted ACH data",
-            "fraud_copy_paste_vch": "Copy pasted VCH data",
-            "fraud_copy_paste_prl": "Copy pasted PRL data",
-            "failed_sp_qc": "Absurd psychedelics responses",
+        reasons_map = {
+            "failedAttnCheck":          ("Failed attention check", attn_check_reasons),
+            "failed_new_qc":            ("Failed race/age consistency QC", {}),
+            "failed_drug_age_qc":       ("Drug use age inconsistency (alc_age or mj_age re-confirmed value differs by >3 years)", {}),
+            "failed_drug_life_uses_qc": ("Drug use lifetime/6-month inconsistency", drug_life_lt_sixmo_reasons),
+            "failed_trap_questions":    ("Failed trap/fraud-detection question", trap_question_reasons),
+            "fraud_copy_paste_ach":     ("Copy pasted ACH data", {}),
+            "fraud_copy_paste_vch":     ("Copy pasted VCH data", {}),
+            "fraud_copy_paste_prl":     ("Copy pasted PRL data", {}),
+            "failed_sp_qc":             ("Absurd psychedelics responses", absurdity_reasons),
         }
-        for key, label in note_map.items():
+        for key, (label, detail_dict) in reasons_map.items():
             if record_id in qc_lists.get(key, []):
-                if key == "failed_sp_qc" and record_id in absurdity_reasons:
-                    return f"{label}: {absurdity_reasons[record_id]}"
+                if record_id in detail_dict:
+                    return f"{label}: {detail_dict[record_id]}"
                 return label
         return None
 
@@ -2537,7 +2637,6 @@ class RelaunchQuickQC:
         verification_keys = [
             "failed_usetime_qc",
             "illogical_life",
-            "illogical_year",
             "wrong_recent",
             "nanresponses",
         ]
@@ -2893,6 +2992,14 @@ def main() -> None:
         print(f"\nQC reviewed {len(completion_review.records_to_check)} completed baseline records.")
         if completion_review.expensesheet_path:
             print(f"Expensesheet written to: {completion_review.expensesheet_path}")
+
+        if completion_review.failure_summaries:
+            print(f"\n{len(completion_review.failure_summaries)} record(s) failed QC.")
+            if input("See failure reasons? (y/n): ").strip().lower() == "y":
+                for rid, summary in sorted(completion_review.failure_summaries.items()):
+                    print(f"\nRecord {rid}:")
+                    print(summary)
+
         if ask_yes_no("Import completion QC updates to REDCap? Type 'yes' to confirm: "):
             tool.import_completion_updates(completion_review)
         else:

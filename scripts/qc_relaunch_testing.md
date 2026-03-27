@@ -12,9 +12,9 @@ Three stages of testing:
 |---|---|---|
 | 0 — Eligibility | ELIG-00 to ELIG-15 | `apply` imports fields → you check REDCap manually → press Enter → auto-restores |
 | 1 — Screening fraud | SCR-00 to SCR-18 | `apply` → run QC script → `verify` → `restore screening` |
-| 2 — Baseline QC | BL-00 to BL-31 | `apply` → run QC script → `verify` → `restore baseline` |
+| 2 — Baseline QC | BL-00 to BL-33 | `apply` → run QC script → `verify` → `restore baseline` |
 
-**Total: 16 ELIG + 19 SCR + 32 BL scenarios.**
+**Total: 16 ELIG + 19 SCR + 34 BL scenarios.**
 
 ---
 
@@ -1811,6 +1811,54 @@ Sets `mj_lifetime='1'`, `mj_age='16'`, `mj_age_qc='24'`.
 | `qc_notes` | (contains "Drug use age inconsistency") |
 
 **Verify:** `python3 qc_testing_debug.py verify BL-31`
+**Reset:** `python3 qc_testing_debug.py restore baseline`
+
+---
+
+### BL-32 — alc Lifetime Uses < alc 6-Month Uses
+
+**What it tests:** `alc_life_n=10` (lifetime direct count) and `alc_6mo_n=20` (6-month direct count). REDCap computes `alc_life_uses=10` and `alc_6month=20`; since 10 < 20 this is logically impossible and triggers `failed_drug_life_uses_qc`.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-32
+```
+Sets `alc_lifetime='1'`, `alc_life_freq_pref='1'`, `alc_life_n='10'`, `alc_6month_yn='1'`, `alc_6mo_freq_pref='1'`, `alc_6mo_n='20'`. REDCap's calc engine must compute `alc_life_uses` and `alc_6month` from these source fields before the QC script runs.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 0 |
+| `qc_notes` | (contains "Drug use lifetime/6-month inconsistency" and "alc") |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-32`
+**Reset:** `python3 qc_testing_debug.py restore baseline`
+
+**Notes:** Because `alc_life_uses` and `alc_6month` are REDCap calc fields, their values in the export depend on REDCap having computed them server-side from the imported source fields. If both appear as NaN in the export the check is silently skipped — confirm REDCap computed them before treating a non-flag as a pass.
+
+---
+
+### BL-33 — mj Lifetime Uses < mj 6-Month Uses
+
+**What it tests:** `mj_life_n=5` (lifetime direct count) and `mj_6mo_n=15` (6-month direct count). Same mechanism as BL-32 but for cannabis.
+
+**Setup:**
+```bash
+python3 qc_testing_debug.py apply BL-33
+```
+Sets `mj_lifetime='1'`, `mj_life_freq_pref='1'`, `mj_life_n='5'`, `mj_6month_yn='1'`, `mj_6mo_freq_pref='1'`, `mj_6mo_n='15'`.
+
+**QC script prompts:** User code: `m` | Import: `yes`
+
+**Expected REDCap result:**
+| Field | Expected value |
+|---|---|
+| `qc_passed` | 0 |
+| `qc_notes` | (contains "Drug use lifetime/6-month inconsistency" and "mj") |
+
+**Verify:** `python3 qc_testing_debug.py verify BL-33`
 **Reset:** `python3 qc_testing_debug.py restore baseline`
 
 ---
